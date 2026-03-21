@@ -1,12 +1,15 @@
 """Unit tests for JaxBackend."""
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from pydantic import ValidationError
 
-from skyrl.backends.jax import JaxBackend, JaxBackendConfig
+from skyrl.backends.jax import JaxBackend, JaxBackendConfig, configure_xla_gpu_memory_fraction
 from skyrl.tinker import api, types
 from skyrl.tinker.engine import prepare_model_pass_batch, prepare_sample_batch
 from skyrl.tinker.types import LoraConfig, OptimStepInput
@@ -727,3 +730,25 @@ def test_mixed_train_unembed_adapters():
         atol=1e-4,
         err_msg="Chunked vs non-chunked losses mismatch with mixed train_unembed adapters",
     )
+
+
+def test_jax_backend_config_xla_gpu_mem_fraction_valid():
+    c = JaxBackendConfig(xla_gpu_mem_fraction=0.88)
+    assert c.xla_gpu_mem_fraction == 0.88
+    c_default = JaxBackendConfig()
+    assert c_default.xla_gpu_mem_fraction is None
+
+
+def test_jax_backend_config_xla_gpu_mem_fraction_rejects_out_of_range():
+    with pytest.raises(ValidationError):
+        JaxBackendConfig(xla_gpu_mem_fraction=0.0)
+    with pytest.raises(ValidationError):
+        JaxBackendConfig(xla_gpu_mem_fraction=1.01)
+
+
+def test_configure_xla_gpu_memory_fraction_env(monkeypatch):
+    monkeypatch.delenv("XLA_PYTHON_CLIENT_MEM_FRACTION", raising=False)
+    configure_xla_gpu_memory_fraction(None)
+    assert os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION") is None
+    configure_xla_gpu_memory_fraction(0.9)
+    assert os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] == "0.9"

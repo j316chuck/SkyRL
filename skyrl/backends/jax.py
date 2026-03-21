@@ -11,6 +11,7 @@ or by running this module directly with `python -m skyrl.backends.jax`.
 Usage:
     # Coordinator (process 0) - runs the full engine:
     uv run -m skyrl.tinker.engine --base-model Qwen/Qwen3-8B --backend-config '{
+        "xla_gpu_mem_fraction": 0.9,
         "coordinator_address": "localhost:7777",
         "num_processes": 2,
         ...
@@ -20,6 +21,7 @@ Usage:
     uv run -m skyrl.backends.jax --coordinator-address localhost:7777 --num-processes 2 --process-id 1
 """
 
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -60,6 +62,21 @@ from skyrl.utils.log import logger
 
 _DEFAULT_PPO_CLIP_LOW_THRESHOLD = 0.8
 _DEFAULT_PPO_CLIP_HIGH_THRESHOLD = 1.2
+
+_XLA_MEM_FRACTION_ENV = "XLA_PYTHON_CLIENT_MEM_FRACTION"
+
+
+def configure_xla_gpu_memory_fraction(fraction: float | None) -> None:
+    """Set JAX/XLA GPU memory fraction via environment (must run before GPU client init).
+
+    Maps to ``XLA_PYTHON_CLIENT_MEM_FRACTION`` (see JAX GPU memory documentation).
+    For multi-node runs, set the same value on every process before ``jax.distributed.initialize``
+    (e.g. export the env var, or pass ``--xla-gpu-mem-fraction`` to ``python -m skyrl.backends.jax`` workers).
+    """
+    if fraction is None:
+        return
+    os.environ[_XLA_MEM_FRACTION_ENV] = str(fraction)
+    logger.info(f"Set {_XLA_MEM_FRACTION_ENV}={fraction} for JAX GPU memory preallocation/cap")
 
 
 class JaxBackendConfig(BaseModel, extra="forbid"):
@@ -110,6 +127,17 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
     num_processes: int | None = Field(
         default=None,
         description="Total number of processes in the multi-node cluster",
+    )
+    xla_gpu_mem_fraction: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Caps JAX/XLA GPU memory usage as a fraction of device memory (sets "
+            f"{_XLA_MEM_FRACTION_ENV}). Applied when constructing the coordinator backend before GPU work. "
+            "Multi-node: workers must use the same fraction via this env var or --xla-gpu-mem-fraction "
+            "on the worker CLI before jax.distributed.initialize."
+        ),
     )
 
 
@@ -1073,6 +1101,18 @@ class JaxBackend(JaxBackendImpl):
     """
 
     def __init__(self, base_model: str, config: JaxBackendConfig):
+        configure_xla_gpu_memory_fraction(config.xla_gpu_mem_fraction)
+        if (
+            config.coordinator_address is not None
+            and config.num_processes is not None
+            and config.num_processes > 1
+            and config.xla_gpu_mem_fraction is not None
+        ):
+            logger.warning(
+                "Multi-node JAX: workers must use the same GPU memory fraction before "
+                f"jax.distributed.initialize (e.g. --xla-gpu-mem-fraction {config.xla_gpu_mem_fraction} "
+                f"or export {_XLA_MEM_FRACTION_ENV}={config.xla_gpu_mem_fraction})."
+            )
         self.process_id = 0  # Coordinator is always process 0
         if config.coordinator_address is not None:
             jax.distributed.initialize(
@@ -1132,7 +1172,12 @@ class JaxBackend(JaxBackendImpl):
         self._broadcast_and_call("save_sampler_checkpoint", output_path=output_path, model_id=model_id, persist=persist)
 
 
-def run_worker(coordinator_address: str, num_processes: int, process_id: int):
+def run_worker(
+    coordinator_address: str,
+    num_processes: int,
+    process_id: int,
+    xla_gpu_mem_fraction: float | None = None,
+):
     """Entry point for worker processes.
 
     Initializes JAX distributed, receives config from coordinator, then runs
@@ -1142,9 +1187,13 @@ def run_worker(coordinator_address: str, num_processes: int, process_id: int):
         coordinator_address: JAX coordinator address (host:port)
         num_processes: Total number of processes in the cluster
         process_id: This process's ID (must be > 0 for workers)
+        xla_gpu_mem_fraction: Optional GPU memory fraction; must match coordinator ``backend-config`` /
+            ``XLA_PYTHON_CLIENT_MEM_FRACTION`` env if used there. Applied before ``jax.distributed.initialize``.
     """
     if process_id == 0:
         raise ValueError("Worker process_id must be > 0 (process 0 is the coordinator)")
+
+    configure_xla_gpu_memory_fraction(xla_gpu_mem_fraction)
 
     # Initialize JAX distributed first (before any other JAX operations)
     jax.distributed.initialize(
@@ -1203,9 +1252,23 @@ def main():
         required=True,
         help="This process's ID (must be > 0 for workers)",
     )
+    parser.add_argument(
+        "--xla-gpu-mem-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Optional; must match coordinator --backend-config xla_gpu_mem_fraction. "
+            "Applied before jax.distributed.initialize (workers only)."
+        ),
+    )
 
     args = parser.parse_args()
-    run_worker(args.coordinator_address, args.num_processes, args.process_id)
+    run_worker(
+        args.coordinator_address,
+        args.num_processes,
+        args.process_id,
+        xla_gpu_mem_fraction=args.xla_gpu_mem_fraction,
+    )
 
 
 if __name__ == "__main__":
