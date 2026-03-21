@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -132,6 +132,60 @@ def get_param_key(path: tuple, prefix: str = "") -> str:
     return prefix + ".".join(map(str, path))
 
 
+def get_fused_components(proj_name: str, config: ModelConfig) -> tuple[tuple[str, ...], tuple[int, ...]] | None:
+    """Return (components, group_sizes) for a fused projection, or None if not fused."""
+    if proj_name == "qkv_proj":
+        base = config.get_config()
+        num_heads = base.num_attention_heads
+        num_kv_heads = getattr(base, "num_key_value_heads", num_heads)
+        head_dim = getattr(base, "head_dim", None) or base.hidden_size // num_heads
+        q_per_kv = num_heads // num_kv_heads
+        return ("q_proj", "k_proj", "v_proj"), (q_per_kv * head_dim, head_dim, head_dim)
+    if proj_name == "gate_up_proj":
+        return ("gate_proj", "up_proj"), (1, 1)
+    return None
+
+
+def pack_fused(*arrays: np.ndarray, group_sizes: tuple[int, ...]) -> np.ndarray:
+    """Pack weight arrays by interleaving groups."""
+    leading_dim = arrays[0].shape[0]
+    num_groups = arrays[0].shape[-1] // group_sizes[0]
+    reshaped = [arr.reshape(leading_dim, num_groups, g) for arr, g in zip(arrays, group_sizes)]
+    return np.concatenate(reshaped, axis=2).reshape(leading_dim, -1)
+
+
+def unpack_fused(array: np.ndarray, group_sizes: tuple[int, ...]) -> tuple[np.ndarray, ...]:
+    """Unpack a fused tensor by de-interleaving groups."""
+    leading_dim = array.shape[0]
+    num_groups = array.shape[-1] // sum(group_sizes)
+    reshaped = array.reshape(leading_dim, num_groups, sum(group_sizes))
+    results, offset = [], 0
+    for g in group_sizes:
+        results.append(reshaped[:, :, offset : offset + g].reshape(leading_dim, -1))
+        offset += g
+    return tuple(results)
+
+
+def require_weights(
+    tensors: dict[str, np.ndarray], keys: Sequence[str], checkpoint_dir: str | os.PathLike
+) -> list[np.ndarray]:
+    """Get transposed weight tensors for keys, raising if any are missing."""
+    missing = [k for k in keys if k not in tensors]
+    if missing:
+        raise RuntimeError(f"Missing keys while loading from {checkpoint_dir}: {missing}")
+    return [tensors[k].T for k in keys]
+
+
+def get_shared_lora_A(arrays: Sequence[np.ndarray]) -> np.ndarray:
+    """Return shared LoRA A matrix, validating all arrays are identical."""
+    if not all(np.allclose(arrays[0], arr) for arr in arrays[1:]):
+        raise RuntimeError(
+            "Cannot load split LoRA adapter into fused projection because the source "
+            "branches do not share the same lora_A matrix."
+        )
+    return arrays[0]
+
+
 def get_expert_key(path: tuple, expert_idx: int) -> str:
     "Get the safetensors key for an expert weight model path."
     path = tuple(s if s != "experts" else f"experts.{expert_idx}" for s in path)
@@ -176,13 +230,18 @@ def load_safetensors(
             num_experts = config.get_num_experts()
             assert num_experts is not None
             expert_keys = [get_expert_key(path, i) for i in range(num_experts)]
-            missing_keys = [expert_key for expert_key in expert_keys if expert_key not in tensors]
-            if missing_keys:
-                raise RuntimeError(f"Missing keys while loading from {checkpoint_dir}: {missing_keys}")
-            tensor = np.stack([tensors[expert_key].T for expert_key in expert_keys], axis=0)
+            tensor = np.stack(require_weights(tensors, expert_keys, checkpoint_dir), axis=0)
+        elif (fused := get_fused_components(path[-2], config)) is not None:
+            components, group_sizes = fused
+            keys = [get_param_key((*path[:-2], name, path[-1])) for name in components]
+            weights = require_weights(tensors, keys, checkpoint_dir)
+            if path[-1] == "lora_A":
+                tensor = get_shared_lora_A(weights)
+            else:
+                tensor = pack_fused(*weights, group_sizes=group_sizes)
+        elif key not in tensors:
+            raise RuntimeError(f"Missing key while loading from {checkpoint_dir}: {key}")
         else:
-            if key not in tensors:
-                raise RuntimeError(f"Missing key while loading from {checkpoint_dir}: {key}")
             tensor = tensors[key] if "embed_tokens" in key else tensors[key].T
         adapter_idx = get_adapter_slice(path, adapter_index, rank)
         if adapter_idx is not None:
@@ -234,6 +293,16 @@ def save_safetensors(
             param = param.reshape(param.shape[0], -1)
         elif "o_proj" in path:
             param = param.reshape(-1, param.shape[-1])
+        elif (fused := get_fused_components(path[-2], config)) is not None:
+            components, group_sizes = fused
+            keys = [get_param_key((*path[:-2], name, path[-1]), prefix=prefix) for name in components]
+            if path[-1] == "lora_A":
+                for k in keys:
+                    tensors[k] = param.T
+            else:
+                for k, p in zip(keys, unpack_fused(param, group_sizes=group_sizes)):
+                    tensors[k] = p.T
+            continue
         tensors[key] = param if "embed_tokens" in path else param.T
 
     # In multi-host mode, gather all shards and only save from rank 0
