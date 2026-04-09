@@ -85,9 +85,9 @@ skyrl-train = [
     "tensordict",
     "jaxtyping",
     "skyrl-gym",
-    # One prebuilt wheel (cu12 + torch 2.11) for Linux x86_64 CPython 3.13; other Linux installs use PyPI 2.8.3 (may build).
-    "flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.11/flash_attn-2.8.3%2Bcu12torch2.11cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.13' and platform_machine == 'x86_64'",
-    "flash-attn==2.8.3; sys_platform == 'linux' and (python_version != '3.13' or platform_machine != 'x86_64')",
+    # Prebuilt wheel (cu12 + torch 2.11) for Linux x86_64 CPython 3.12 (torchvision+cu128 wheels are unreliable on 3.13).
+    "flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.11/flash_attn-2.8.3%2Bcu12torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'",
+    "flash-attn==2.8.3; sys_platform == 'linux' and (python_version != '3.12' or platform_machine != 'x86_64')",
     "polars",
     "s3fs",
     "fastapi",
@@ -214,7 +214,8 @@ override-dependencies = [
     # vLLM 0.19 pins torch 2.10; flash-attn prebuilt wheels need torch 2.11 (see skyrl-train/fsdp extras).
     "torch==2.11.0; sys_platform == 'linux'",
     "torchaudio==2.11.0; sys_platform == 'linux'",
-    "torchvision==0.22.0; sys_platform == 'linux'",
+    # Match torch 2.11 libc10_cuda ABI (older torchvision+cu128 wheels expect c10_cuda_check ..._ib vs ..._jb).
+    "torchvision==0.26.0; sys_platform == 'linux'",
 ]
 
 [tool.uv.extra-build-dependencies]
