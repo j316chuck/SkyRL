@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import transformers
-from flash_attn.bert_padding import pad_input, unpad_input
 from loguru import logger
 from packaging.version import Version
 from peft import LoraConfig, TaskType, get_peft_model
@@ -331,6 +330,7 @@ class HFModelWrapper(nn.Module):
         attention_mask_fwd = attention_mask
         if self.use_sample_packing:
             with torch.no_grad():
+                from flash_attn.bert_padding import unpad_input
                 # Removes padding to get a packed tensor. `unpad_input` expects 3 dimensional tensor so we unsqueeze first
                 sequences_fwd, nnz_indices, _, _, _ = unpad_input(
                     sequences.unsqueeze(-1), attention_mask=attention_mask
@@ -395,6 +395,7 @@ class HFModelWrapper(nn.Module):
             )  # shape can be (1, nnz) - with packing or (B, S) - without packing
 
         if self.use_sample_packing:
+            from flash_attn.bert_padding import pad_input, unpad_input
             # add padding back - postprocess logprobs to be compatible with original tensor
             batch_size, seqlen = attention_mask.shape
             # (1, nnz-1) -> (batch_size, seqlen). Pad token ID used by flash attention is 0.
@@ -506,6 +507,7 @@ def _get_critic_model(
             attention_mask_fwd = attention_mask
 
             if self.use_sample_packing:
+                from flash_attn.bert_padding import pad_input, unpad_input
                 with torch.no_grad():
                     # remove padding. `unpad_input` expects 3 dimensional tensor
                     input_ids_fwd, nnz_indices, _, _, _ = unpad_input(
@@ -550,6 +552,7 @@ def _get_critic_model(
             values_BSH = getattr(self, self.value_head_prefix)(last_hidden_states_BSH)
 
             if self.use_sample_packing:
+                from flash_attn.bert_padding import pad_input, unpad_input
                 # add padding back - postprocess logits to be compatible with original tensors
                 batch_size, seqlen = attention_mask.shape
                 # (1, nnz, 1) -> (nnz, 1) -> (batch_size, seqlen, 1)

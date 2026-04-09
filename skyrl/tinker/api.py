@@ -1305,22 +1305,23 @@ async def root():
     }
 
 
-if __name__ == "__main__":
+def main() -> None:
     import argparse
 
     import uvicorn
 
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(description="SkyRL tinker API server")
     add_model(parser, EngineConfig)
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     args = parser.parse_args()
 
-    # Create EngineConfig from parsed arguments (only EngineConfig fields)
     engine_config = EngineConfig.model_validate({k: v for k, v in vars(args).items() if k in EngineConfig.model_fields})
 
-    # Store config in app.state so lifespan can access it
     app.state.engine_config = engine_config
 
     uvicorn.run(app, host=args.host, port=args.port, log_config=get_uvicorn_log_config())
+
+
+if __name__ == "__main__":
+    main()

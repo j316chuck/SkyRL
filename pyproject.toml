@@ -85,10 +85,9 @@ skyrl-train = [
     "tensordict",
     "jaxtyping",
     "skyrl-gym",
-    # TODO (aaron): Once PyTorch 2.10 is officially supported (stable PyPI torch + matching
-    # flash-attn wheels), drop the custom wheel URL
-    "flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'",
-    "flash-attn==2.8.3; sys_platform == 'linux' and (python_version != '3.12' or platform_machine != 'x86_64')",
+    # One prebuilt wheel (cu12 + torch 2.11) for Linux x86_64 CPython 3.13; other Linux installs use PyPI 2.8.3 (may build).
+    "flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.11/flash_attn-2.8.3%2Bcu12torch2.11cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.13' and platform_machine == 'x86_64'",
+    "flash-attn==2.8.3; sys_platform == 'linux' and (python_version != '3.13' or platform_machine != 'x86_64')",
     "polars",
     "s3fs",
     "fastapi",
@@ -102,11 +101,7 @@ fsdp = [
     "skyrl[skyrl-train]",
     "vllm==0.19.0; sys_platform == 'linux'",
     "vllm-router; sys_platform == 'linux'",
-    # TODO (aaron): Once PyTorch 2.10 is officially supported (stable PyPI torch + matching
-    # flash-attn wheels), drop the custom wheel URL
-    "flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'",
-    "flash-attn==2.8.3; sys_platform == 'linux' and (python_version != '3.12' or platform_machine != 'x86_64')",
-    "torch==2.10.0; sys_platform == 'linux'",
+    "torch==2.11.0; sys_platform == 'linux'",
     "flashinfer-python==0.6.6; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "flashinfer-jit-cache==0.6.6; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision; sys_platform == 'linux'",
@@ -115,13 +110,9 @@ fsdp = [
 megatron = [
     "skyrl[skyrl-train]",
     "transformer-engine[pytorch]==2.10.0; sys_platform == 'linux'",
-    # TODO (aaron): Once PyTorch 2.10 is officially supported (stable PyPI torch + matching
-    # flash-attn wheels), drop the custom wheel URL
-    "flash-attn @ https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'",
-    "flash-attn==2.8.3; sys_platform == 'linux' and (python_version != '3.12' or platform_machine != 'x86_64')",
     "vllm==0.19.0; sys_platform == 'linux'",
     "vllm-router; sys_platform == 'linux'",
-    "torch==2.10.0; sys_platform == 'linux'",
+    "torch==2.11.0; sys_platform == 'linux'",
     "flashinfer-python==0.6.6; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torchvision; sys_platform == 'linux'",
     # megatron-bridge requires Python 3.12+; pin megatron-core to the same
@@ -175,7 +166,7 @@ include-package-data = true
 version = {attr = "skyrl.__version__"}
 
 [project.scripts]
-# The following is for supporting the skyrl-train dependency
+skyrl-tinker-api = "skyrl.tinker.api:main"
 
 [tool.uv]
 # Resolve for both Linux (production) and macOS (dev)
@@ -220,6 +211,10 @@ override-dependencies = [
     "transformers>=5.0.0,<=5.3.0; sys_platform == 'linux'",
     "megatron-core>=0.16.0; sys_platform == 'linux'",
     "ml_dtypes>=0.5.0; sys_platform == 'linux'",
+    # vLLM 0.19 pins torch 2.10; flash-attn prebuilt wheels need torch 2.11 (see skyrl-train/fsdp extras).
+    "torch==2.11.0; sys_platform == 'linux'",
+    "torchaudio==2.11.0; sys_platform == 'linux'",
+    "torchvision==0.22.0; sys_platform == 'linux'",
 ]
 
 [tool.uv.extra-build-dependencies]
