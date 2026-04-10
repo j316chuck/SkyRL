@@ -358,7 +358,6 @@ class TinkerEngine:
                 len(barriers),
             )
 
-        batchable = ops
         return {
             str(f.request_id): (f.model_id, types.ForwardBackwardInput.model_validate(f.request_data))
             for f in batchable
