@@ -204,6 +204,7 @@ async def create_future(
     )
     session.add(future_db)
     await session.flush()  # Flush to generate auto-increment request_id
+    logger.info(f"create_future future_db: {future_db.request_type=} {future_db.model_id=} {future_db.status=}, {future_db.request_id=}")
     assert future_db.request_id
     return future_db.request_id
 
@@ -841,6 +842,7 @@ async def get_training_run(model_id: str, session: AsyncSession = Depends(get_se
 async def forward_backward(request: ForwardBackwardRequest, session: AsyncSession = Depends(get_session)):
     """Compute and accumulate gradients."""
     await get_model(session, request.model_id)
+    logger.info(f"forward_backward request: {request}")
 
     request_id = await create_future(
         session=session,
@@ -848,9 +850,17 @@ async def forward_backward(request: ForwardBackwardRequest, session: AsyncSessio
         model_id=request.model_id,
         request_data=request.forward_backward_input.to_types(),
     )
+    logger.info(f"forward_backward request_id: {request_id}")
 
     await session.commit()
+    logger.info(f"forward_backward committed")
 
+    future = await session.get(FutureDB, request_id)
+    logger.info(f"forward_backward future: {future}")
+    if future is None or future.status != RequestStatus.PENDING:
+        logger.error(f"forward_backward request_id not pending: {request_id}")
+        return FutureResponse(future_id=str(request_id), status="failed", request_id=str(request_id))
+    
     return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
 
 

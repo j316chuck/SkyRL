@@ -331,6 +331,7 @@ class TinkerEngine:
             .order_by(FutureDB.request_id)
         )
         ops = session.exec(query).all()
+        logger.info(f"find_batchable_model_passes ops: {ops} len: {len(ops)}")
 
         # Filter: only include ops that come before their model's barrier
         batchable = [op for op in ops if op.model_id not in barriers or op.request_id < barriers[op.model_id]]
@@ -717,6 +718,7 @@ class TinkerEngine:
         """Main loop to process pending requests."""
         while True:
             # Query for pending requests and extract data within session context
+            logger.info(f"finding batchable requests")
             with Session(self.db_engine) as session:
                 # Use look-ahead scheduling to find batchable forward_backward and forward model passes
                 forward_backward_requests = self.find_batchable_model_passes(
@@ -727,12 +729,18 @@ class TinkerEngine:
                 sample_requests = self.find_batchable_sample(session)
                 # Get other pending requests (non forward_backward and non sampling)
                 other_requests = self.find_single_requests(session)
-
+            
+            logger.info(f"forward_backward_requests: {forward_backward_requests} len: {len(forward_backward_requests)}")
+            logger.info(f"forward_requests: {forward_requests} len: {len(forward_requests)}")
+            logger.info(f"sample_requests: {sample_requests} len: {len(sample_requests)}")
+            logger.info(f"other_requests: {other_requests} len: {len(other_requests)}")
+            logger.info(f"processing batches")
             # Process batches outside of session context
             self.process_batch_requests(forward_backward_requests, self.process_forward_backward, "forward_backward")
             self.process_batch_requests(forward_requests, self.process_forward, "forward")
             self.process_batch_requests(sample_requests, self.process_sample, "sample")
-
+            logger.info(f"processed batches")
+            
             # Process other request types individually (in the future we can also batch independent optim_steps)
             self.process_single_requests(other_requests)
 
@@ -741,7 +749,7 @@ class TinkerEngine:
             if cleanup_enabled and time.time() - self._last_cleanup_time > self.config.session_cleanup_interval_sec:
                 _ = self.cleanup_stale_sessions()
                 self._last_cleanup_time = time.time()
-
+            
             # Poll every 1s
             time.sleep(1.0)
 
