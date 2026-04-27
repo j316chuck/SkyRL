@@ -333,8 +333,14 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
     full_sd_is_materialized = bool(flag.item())
 
     if full_sd_is_materialized:
-        # Agree on the iteration order across ranks (rank-0's keys), then
-        # each rank shards its own tensor locally.
+        # Agree on iteration order, then each rank computes its local
+        # shard from its own copy of the full tensor — no NCCL needed.
+        # We manually slice to the local shard per `placements`, then
+        # build the DTensor from that local data via `DTensor.from_local`
+        # with `src_data_rank=None` (no broadcast, no full-tensor retention).
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor.placement_types import Replicate, Shard
+
         rank0_keys: list[str] = list(full_sd.keys()) if dist.get_rank() == 0 else []
         keys_holder = [rank0_keys]
         dist.broadcast_object_list(keys_holder, src=0)
@@ -351,8 +357,32 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
                 full_param = full_param.detach().cuda()
                 if full_param.dtype != sharded_param.dtype:
                     full_param = full_param.to(dtype=sharded_param.dtype)
+
             mesh = sharded_param.device_mesh
-            sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
+            placements = sharded_param.placements
+            full_shape = tuple(full_param.shape)
+
+            # Compute local shard by chunking along each Shard()-placement
+            # mesh dim, in mesh-dim order, indexing by this rank's coordinate.
+            local = full_param
+            for mesh_dim, p in enumerate(placements):
+                if isinstance(p, Shard):
+                    mesh_size = mesh.size(mesh_dim)
+                    coord = mesh.get_coordinate()[mesh_dim]
+                    chunks = torch.chunk(local, mesh_size, dim=p.dim)
+                    if coord < len(chunks):
+                        local = chunks[coord].contiguous()
+                    else:
+                        local = torch.empty(
+                            (0,) + tuple(local.shape[1:]),
+                            dtype=local.dtype,
+                            device=local.device,
+                        )
+                # Replicate / Partial: keep the full local as-is.
+
+            sharded_tensor = DTensor.from_local(
+                local, mesh, placements, run_check=False, shape=torch.Size(full_shape)
+            )
             to_contiguous, casting_dtype = _infer_parameter_dtype(
                 model,
                 param_name,
@@ -360,6 +390,8 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             )
             sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
             sharded_sd[param_name] = sharded_tensor
+            # Drop the full tensor so the next iteration doesn't accumulate.
+            del full_param, local
     elif dist.get_rank() == 0:
         for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
             full_param = full_param.detach().cuda()
