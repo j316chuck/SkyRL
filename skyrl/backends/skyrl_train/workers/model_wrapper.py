@@ -128,6 +128,43 @@ class HFModelWrapper(nn.Module):
                 model_config.rope_theta = rope_theta
             model_config._attn_implementation = self.attn_implementation
 
+            # gpt-oss ships MXFP4-packed.  Two independent reasons we want
+            # `Mxfp4Config(dequantize=True)`:
+            #
+            #  (a) Layout match across ranks.  Default `from_pretrained`
+            #      builds `Mxfp4GptOssExperts` (543 state-dict keys for
+            #      120B), while non-rank-0 meta `from_config` builds the
+            #      regular `GptOssExperts` (615 keys).  The 72-key delta
+            #      is exactly `model.layers.{i}.mlp.experts.{gate_up_proj,
+            #      down_proj}` — bf16 nn.Parameters on `GptOssExperts`,
+            #      replaced on `Mxfp4GptOssExperts` by packed `*_blocks`
+            #      / `*_scales` buffers + a triton tensor attribute that
+            #      isn't in the state_dict.  `fsdp2_load_full_state_dict`
+            #      iterates state_dict items per rank, so the size
+            #      mismatch desyncs NCCL and `create_model` hangs.
+            #      `dequantize=True` makes rank 0 also build
+            #      `GptOssExperts` (615 keys); layouts now match.
+            #
+            #  (b) Differentiable MoE.  `Mxfp4GptOssExperts.forward`
+            #      calls `triton_kernels_hub.matmul_ogs`, a custom kernel
+            #      with no autograd backward.  Even with LoRA on attn,
+            #      gradient cannot flow through the MoE so the policy
+            #      doesn't learn.  `dequantize=True` swaps in the regular
+            #      bf16 path which is autograd-friendly.
+            quantization_config = nf4_config
+            if (
+                quantization_config is None
+                and getattr(model_config, "model_type", "") == "gpt_oss"
+            ):
+                from transformers import Mxfp4Config
+
+                quantization_config = Mxfp4Config(dequantize=True)
+                logger.info(
+                    "[gpt_oss] passing Mxfp4Config(dequantize=True) so all ranks "
+                    "produce the GptOssExperts (bf16) layout and the MoE forward "
+                    "is differentiable"
+                )
+
             if meta_init:
                 with torch.device("meta"):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
@@ -138,7 +175,7 @@ class HFModelWrapper(nn.Module):
                     config=model_config,
                     trust_remote_code=True,
                     attn_implementation=self.attn_implementation,
-                    quantization_config=nf4_config,
+                    quantization_config=quantization_config,
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                     device_map=device_map,
                 )
@@ -195,12 +232,15 @@ class HFModelWrapper(nn.Module):
             # MoE - balancing loss
             model_config = self.model.config.to_dict()
             if "output_router_logits" in model_config:
-                # Skip for granitemoehybrid: its decoder layers don't return router
-                # logits, so enabling this flag causes an IndexError in
-                # load_balancing_loss_func when it tries to access empty gate_logits.
-                if model_config.get("model_type") == "granitemoehybrid":
+                # Skip for granitemoehybrid (decoder layers don't return
+                # router logits) and gpt_oss (`MoeModelOutputWithPast`
+                # doesn't carry router_logits in this transformers
+                # version, so `load_balancing_loss_func` IndexErrors on
+                # the empty gate_logits tuple).
+                if model_config.get("model_type") in ("granitemoehybrid", "gpt_oss"):
                     logger.info(
-                        "[MoE] granitemoehybrid detected, skipping output_router_logits (decoder layers don't return router logits)"
+                        f"[MoE] {model_config.get('model_type')} detected, "
+                        "skipping output_router_logits"
                     )
                 else:
                     logger.info("[MoE] set output_router_logits as True")

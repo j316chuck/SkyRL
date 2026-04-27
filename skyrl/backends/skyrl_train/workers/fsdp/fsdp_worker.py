@@ -168,6 +168,15 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         use_meta = should_use_meta_init(
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
         )
+        # gpt-oss key-mismatch fix: keep the default `use_meta` (True on
+        # non-rank-0).  `HFModelWrapper` passes `Mxfp4Config(dequantize=True)`
+        # to rank-0 `from_pretrained`, so rank 0 produces the regular
+        # `GptOssExperts` (615-key) layout that matches non-rank-0
+        # meta-init via `from_config`.  All ranks then issue the same
+        # number of broadcasts in `fsdp2_load_full_state_dict`.  We
+        # deliberately do NOT force `use_meta=False`: that makes every
+        # Ray actor on a node materialize ~200 GB bf16 weights and OOMs
+        # the node at 120B (8 actors * 200 GB > 1.7 TB).
 
         wrapped_model = HFModelWrapper(
             model_path,

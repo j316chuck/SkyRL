@@ -315,7 +315,34 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             tensor = tensor.contiguous()
         return tensor
 
-    if dist.get_rank() == 0:
+    # Fast path: when every rank already has a real (non-meta) `full_sd`,
+    # no NCCL is needed — each rank computes its local shard from its own
+    # copy via `distribute_tensor`.  All ranks must agree on which branch
+    # to take or we deadlock, so MIN-reduce a flag across ranks.
+    rank_has_real = int(
+        len(full_sd) > 0 and all(not p.is_meta for p in full_sd.values())
+    )
+    flag = torch.tensor(
+        [rank_has_real], device=torch.cuda.current_device(), dtype=torch.int32
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    if bool(flag.item()):
+        rank0_keys: list[str] = list(full_sd.keys()) if dist.get_rank() == 0 else []
+        keys_holder = [rank0_keys]
+        dist.broadcast_object_list(keys_holder, src=0)
+        for param_name in keys_holder[0]:
+            sharded_param = meta_sharded_sd.get(param_name)
+            if sharded_param is None:
+                continue
+            full_param = full_sd[param_name].detach().cuda()
+            if full_param.dtype != sharded_param.dtype:
+                full_param = full_param.to(dtype=sharded_param.dtype)
+            mesh = sharded_param.device_mesh
+            sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
+            to_contiguous, casting_dtype = _infer_parameter_dtype(model, param_name, full_param)
+            sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
+            sharded_sd[param_name] = sharded_tensor
+    elif dist.get_rank() == 0:
         for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
             full_param = full_param.detach().cuda()
             mesh = sharded_param.device_mesh
