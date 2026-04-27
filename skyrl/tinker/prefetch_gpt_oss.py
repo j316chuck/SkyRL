@@ -24,6 +24,64 @@ import time
 READY_MARKER = ".bf16-ready"
 
 
+def _parse_shard_size(spec: str) -> int:
+  """Parse strings like '20GB' / '500MB' / '1500000000' into bytes."""
+  s = spec.strip().upper()
+  units = {"KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12}
+  for suf, mult in units.items():
+    if s.endswith(suf):
+      return int(float(s[: -len(suf)]) * mult)
+  return int(s)
+
+
+def _save_bf16_state_dict_as_safetensors(model, dst_dir: str, max_shard_size: str) -> None:
+  """Write `model.state_dict()` to dst_dir as sharded safetensors files plus an index.json.
+
+  Avoids transformers' save_pretrained which can't round-trip a dequantized
+  MXFP4 model.
+  """
+  import os
+
+  from safetensors.torch import save_file
+
+  state_dict = model.state_dict()
+  shard_budget = _parse_shard_size(max_shard_size)
+
+  shards: list[dict[str, "torch.Tensor"]] = [{}]
+  shard_sizes: list[int] = [0]
+  for name, tensor in state_dict.items():
+    tensor = tensor.detach().contiguous()
+    nbytes = int(tensor.numel()) * tensor.element_size()
+    if shards[-1] and shard_sizes[-1] + nbytes > shard_budget:
+      shards.append({})
+      shard_sizes.append(0)
+    shards[-1][name] = tensor
+    shard_sizes[-1] += nbytes
+
+  total_size = sum(shard_sizes)
+  total_shards = len(shards)
+  weight_map: dict[str, str] = {}
+  for i, shard in enumerate(shards, start=1):
+    fname = f"model-{i:05d}-of-{total_shards:05d}.safetensors"
+    path = os.path.join(dst_dir, fname)
+    save_file(shard, path, metadata={"format": "pt"})
+    for name in shard:
+      weight_map[name] = fname
+    print(
+      f"[prefetch_gpt_oss]   wrote shard {i}/{total_shards} -> {fname} "
+      f"({shard_sizes[i - 1] / 1e9:.2f} GB, {len(shard)} tensors)",
+      flush=True,
+    )
+
+  index = {"metadata": {"total_size": int(total_size)}, "weight_map": weight_map}
+  with open(os.path.join(dst_dir, "model.safetensors.index.json"), "w") as f:
+    json.dump(index, f, indent=2)
+  print(
+    f"[prefetch_gpt_oss]   wrote model.safetensors.index.json (total_size={total_size / 1e9:.2f} GB)",
+    flush=True,
+  )
+
+
 def main() -> int:
   ap = argparse.ArgumentParser()
   ap.add_argument("--model", required=True, help="HF id or local path of the MXFP4 source model")
@@ -65,21 +123,29 @@ def main() -> int:
   print(f"[prefetch_gpt_oss] dequant + load took {load_end - start:.1f}s", flush=True)
 
   print(f"[prefetch_gpt_oss] saving bf16 to {args.dst} (max_shard_size={args.max_shard_size})...", flush=True)
-  model.save_pretrained(args.dst, max_shard_size=args.max_shard_size, safe_serialization=True)
+  # transformers' model.save_pretrained() refuses to write a dequantized MXFP4
+  # model back through its weight-conversion pipeline (raises
+  # NotImplementedError from revert_weight_conversion). Bypass that by writing
+  # raw safetensors shards from the live state_dict, plus a model.safetensors
+  # .index.json. We then write a plain config.json (without
+  # quantization_config) and a generation_config.json so HF / vLLM treat the
+  # output dir as a regular bf16 checkpoint.
+  _save_bf16_state_dict_as_safetensors(model, args.dst, max_shard_size=args.max_shard_size)
   save_end = time.time()
-  print(f"[prefetch_gpt_oss] save_pretrained took {save_end - load_end:.1f}s", flush=True)
+  print(f"[prefetch_gpt_oss] safetensors write took {save_end - load_end:.1f}s", flush=True)
 
-  # Drop the MXFP4 quantization marker from the on-disk config.json so HF /
-  # vLLM treat the new copy as a plain bf16 checkpoint.
-  cfg_path = os.path.join(args.dst, "config.json")
-  if os.path.isfile(cfg_path):
-    with open(cfg_path) as f:
-      cfg = json.load(f)
-    if "quantization_config" in cfg:
-      del cfg["quantization_config"]
-      with open(cfg_path, "w") as f:
-        json.dump(cfg, f, indent=2)
-      print("[prefetch_gpt_oss] stripped quantization_config from config.json", flush=True)
+  # Save a plain config.json (with quantization_config removed) and the
+  # generation_config that the loaded model knows about.
+  plain_config = model.config.to_dict()
+  plain_config.pop("quantization_config", None)
+  with open(os.path.join(args.dst, "config.json"), "w") as f:
+    json.dump(plain_config, f, indent=2)
+  print("[prefetch_gpt_oss] wrote plain config.json (no quantization_config)", flush=True)
+  if model.generation_config is not None:
+    try:
+      model.generation_config.save_pretrained(args.dst)
+    except Exception as exc:
+      print(f"[prefetch_gpt_oss] generation_config save failed (non-fatal): {exc}", flush=True)
 
   # Mirror the tokenizer files so callers can point at the local dir end-to-
   # end. AutoTokenizer.from_pretrained handles the copy via save_pretrained.
