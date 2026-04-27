@@ -315,7 +315,73 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             tensor = tensor.contiguous()
         return tensor
 
-    if dist.get_rank() == 0:
+    # Fast path: when every rank has a non-meta full state_dict (e.g.
+    # use_meta=False so every rank ran from_pretrained), each rank computes
+    # its local shard from its own copy of the tensor — no NCCL broadcast,
+    # no full-tensor accumulation on GPU.  All ranks must agree on the
+    # branch via MIN reduce, otherwise a meta-init rank waiting for a
+    # broadcast would deadlock with a non-meta-init rank skipping it.
+    rank_full_sd_materialized = int(
+        len(full_sd) > 0 and all(not p.is_meta for p in full_sd.values())
+    )
+    flag = torch.tensor(
+        [rank_full_sd_materialized], device=torch.cuda.current_device(), dtype=torch.int32
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    full_sd_is_materialized = bool(flag.item())
+
+    if full_sd_is_materialized:
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor.placement_types import Shard
+
+        # Iterate by rank-0's key order (broadcast for agreement).
+        rank0_keys: list[str] = list(full_sd.keys()) if dist.get_rank() == 0 else []
+        keys_holder = [rank0_keys]
+        dist.broadcast_object_list(keys_holder, src=0)
+        for param_name in keys_holder[0]:
+            sharded_param = meta_sharded_sd.get(param_name)
+            if sharded_param is None:
+                continue
+            full_param = full_sd.get(param_name)
+            if full_param is None:
+                full_param = torch.zeros(
+                    sharded_param.size(), dtype=sharded_param.dtype
+                )
+            mesh = sharded_param.device_mesh
+            placements = sharded_param.placements
+            full_shape = tuple(full_param.shape)
+
+            # Compute the local shard by chunking along each Shard()
+            # placement's mesh dim, indexed by this rank's coordinate.
+            local = full_param.detach()
+            if local.dtype != sharded_param.dtype:
+                local = local.to(dtype=sharded_param.dtype)
+            for mesh_dim, p in enumerate(placements):
+                if isinstance(p, Shard):
+                    mesh_size = mesh.size(mesh_dim)
+                    coord = mesh.get_coordinate()[mesh_dim]
+                    chunks = torch.chunk(local, mesh_size, dim=p.dim)
+                    if coord < len(chunks):
+                        local = chunks[coord].contiguous()
+                    else:
+                        local = torch.empty(
+                            (0,) + tuple(local.shape[1:]),
+                            dtype=local.dtype,
+                            device=local.device,
+                        )
+            local = local.cuda(non_blocking=True)
+            sharded_tensor = DTensor.from_local(
+                local, mesh, placements, run_check=False, shape=torch.Size(full_shape)
+            )
+            to_contiguous, casting_dtype = _infer_parameter_dtype(
+                model,
+                param_name,
+                full_param,
+            )
+            sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
+            sharded_sd[param_name] = sharded_tensor
+            del full_param, local
+    elif dist.get_rank() == 0:
         for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
             full_param = full_param.detach().cuda()
             mesh = sharded_param.device_mesh
