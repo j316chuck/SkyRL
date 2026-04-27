@@ -336,8 +336,7 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             # many params (e.g. gpt-oss-120b ~615 params totaling
             # 234 GB into a 144 GB H200).
             del full_param
-            if i % 32 == 31:
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
     # We need this else to have a matching `broadcast` for all of the ranks, else we deadlock
     else:
         for i, (param_name, sharded_param) in enumerate(meta_sharded_sd.items()):
@@ -353,8 +352,7 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
             sharded_sd[param_name] = sharded_tensor
             del full_tensor
-            if i % 32 == 31:
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
     # we set `assign=True` because our params can be on meta device
     model.load_state_dict(sharded_sd, assign=True)
