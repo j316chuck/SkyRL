@@ -133,16 +133,32 @@ class HFModelWrapper(nn.Module):
             # expert weights stay in 4-bit packed form and FSDP can't update
             # them.
             quant_config = nf4_config
+            load_device_map = device_map
             if quant_config is None and model_config.model_type == "gpt_oss":
                 from transformers import Mxfp4Config
 
                 quant_config = Mxfp4Config(dequantize=True)
+                # Route the dequant onto the local rank's GPU instead of host
+                # RAM. CPU dequant is ~40 minutes for gpt-oss-120b on a 6-rank
+                # FSDP setup; doing it on the GPU and letting FSDP re-shard
+                # right after brings that down by ~10x. For models too large
+                # to fit on one GPU (e.g. 120b dequantized = ~240GB) we cap
+                # the GPU memory so HF spills the overflow to CPU.
+                if device_map is None and torch.cuda.is_available():
+                    cur = torch.cuda.current_device()
+                    free_b, _ = torch.cuda.mem_get_info(cur)
+                    free_gib = max(int(free_b // (1024**3)) - 8, 8)
+                    load_device_map = "auto"
+                    kwargs.setdefault("max_memory", {cur: f"{free_gib}GiB", "cpu": "1500GiB"})
 
             if meta_init:
                 with torch.device("meta"):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
                 self.model.to(torch.bfloat16 if bf16 else torch.float32)
             else:
+                from_pretrained_kwargs = {}
+                if "max_memory" in kwargs:
+                    from_pretrained_kwargs["max_memory"] = kwargs.pop("max_memory")
                 self.model = model_class.from_pretrained(
                     pretrain_or_model,
                     config=model_config,
@@ -150,7 +166,8 @@ class HFModelWrapper(nn.Module):
                     attn_implementation=self.attn_implementation,
                     quantization_config=quant_config,
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
-                    device_map=device_map,
+                    device_map=load_device_map,
+                    **from_pretrained_kwargs,
                 )
 
             # gpt oss
