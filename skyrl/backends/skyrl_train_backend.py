@@ -46,6 +46,42 @@ from skyrl.utils.tok import get_tokenizer
 # Fixed LoRA adapter name used for generation requests when LoRA is active.
 _SKYRL_LORA_ADAPTER_NAME = "skyrl-lora"
 
+# Env var that points at a pre-dequantized bf16 copy of an MXFP4 gpt-oss
+# checkpoint. When set and the directory exists with a readiness marker we
+# redirect both FSDP and vLLM loads to that local copy, avoiding the per-rank
+# CPU dequant on every cold start.
+_GPT_OSS_BF16_DIR_ENV = "SKYRL_GPT_OSS_BF16_DIR"
+_GPT_OSS_BF16_READY_MARKER = ".bf16-ready"
+
+
+def _maybe_redirect_to_prefetched_bf16(base_model: str) -> str:
+    """If `base_model` looks like a gpt-oss MXFP4 checkpoint and the env var
+    SKYRL_GPT_OSS_BF16_DIR points at a ready local bf16 copy of it, return
+    that local path so SkyRL loads from /dev/shm (or wherever the operator
+    mounted it) instead of dequantizing from MXFP4 again on every rank.
+    """
+    if not base_model or "gpt-oss" not in base_model.lower():
+        return base_model
+    bf16_dir = os.environ.get(_GPT_OSS_BF16_DIR_ENV)
+    if not bf16_dir:
+        return base_model
+    marker = os.path.join(bf16_dir, _GPT_OSS_BF16_READY_MARKER)
+    if not os.path.isfile(marker):
+        logger.info(
+            "[gpt-oss prefetch] %s set to %s but %s missing — falling back to MXFP4 dequant from %s",
+            _GPT_OSS_BF16_DIR_ENV,
+            bf16_dir,
+            marker,
+            base_model,
+        )
+        return base_model
+    logger.info(
+        "[gpt-oss prefetch] redirecting %s -> %s (using pre-dequantized bf16 weights)",
+        base_model,
+        bf16_dir,
+    )
+    return bf16_dir
+
 
 class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
     """Configuration overrides for the SkyRL-Train backend.
@@ -82,7 +118,8 @@ def _build_skyrl_train_config(
     # override base model path
     # NOTE: It is better to add this as a part of the CLI overrides since we have post_init logic
     # that will resolve other attributes such as the reference model path based on the policy model path.
-    user_overrides["trainer.policy.model.path"] = base_model
+    resolved_model_path = _maybe_redirect_to_prefetched_bf16(base_model)
+    user_overrides["trainer.policy.model.path"] = resolved_model_path
     cfg = SkyRLTrainConfig.from_cli_overrides(user_overrides)
 
     # Disable scheduler - Tinker manages learning rate externally via set_lr()
@@ -127,7 +164,7 @@ class SkyRLTrainBackend(AbstractBackend):
         self._model_metadata: types.ModelMetadata | None = None
         self._cfg = None
         self._dispatch: WorkerDispatch | None = None
-        self._tokenizer: AutoTokenizer = get_tokenizer(self.base_model)
+        self._tokenizer: AutoTokenizer = get_tokenizer(_maybe_redirect_to_prefetched_bf16(self.base_model))
         self._inference_engine_client = None
         self._inference_engines_initialized = False
 
