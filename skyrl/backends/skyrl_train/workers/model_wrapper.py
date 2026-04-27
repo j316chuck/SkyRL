@@ -128,6 +128,16 @@ class HFModelWrapper(nn.Module):
                 model_config.rope_theta = rope_theta
             model_config._attn_implementation = self.attn_implementation
 
+            # gpt-oss ships pretrained weights in MXFP4. We need to dequantize
+            # at load time so the whole model is trainable; otherwise the MoE
+            # expert weights stay in 4-bit packed form and FSDP can't update
+            # them.
+            quant_config = nf4_config
+            if quant_config is None and model_config.model_type == "gpt_oss":
+                from transformers import Mxfp4Config
+
+                quant_config = Mxfp4Config(dequantize=True)
+
             if meta_init:
                 with torch.device("meta"):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
@@ -138,7 +148,7 @@ class HFModelWrapper(nn.Module):
                     config=model_config,
                     trust_remote_code=True,
                     attn_implementation=self.attn_implementation,
-                    quantization_config=nf4_config,
+                    quantization_config=quant_config,
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                     device_map=device_map,
                 )
@@ -198,7 +208,7 @@ class HFModelWrapper(nn.Module):
                 # Skip for granitemoehybrid: its decoder layers don't return router
                 # logits, so enabling this flag causes an IndexError in
                 # load_balancing_loss_func when it tries to access empty gate_logits.
-                if model_config.get("model_type") == "granitemoehybrid":
+                if model_config.get("model_type") in ("granitemoehybrid", "gpt_oss"):
                     logger.info(
                         "[MoE] granitemoehybrid detected, skipping output_router_logits (decoder layers don't return router logits)"
                     )
@@ -674,7 +684,7 @@ def get_llm_for_sequence_regression(
     # MoE - balancing loss
     model_config = model.config.to_dict()
     if "output_router_logits" in model_config:
-        if model_config.get("model_type") == "granitemoehybrid":
+        if model_config.get("model_type") in ("granitemoehybrid", "gpt_oss"):
             logger.info(
                 "[MoE] granitemoehybrid detected, skipping output_router_logits (decoder layers don't return router logits)"
             )

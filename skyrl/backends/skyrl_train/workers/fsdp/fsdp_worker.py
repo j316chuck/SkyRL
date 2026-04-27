@@ -166,7 +166,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         use_meta = should_use_meta_init(
-            use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
+            use_meta_tensor=False, mesh=self.strategy.device_mesh
         )
 
         wrapped_model = HFModelWrapper(
@@ -340,7 +340,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
 
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         use_meta = should_use_meta_init(
-            use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
+            use_meta_tensor=False, mesh=self.strategy.device_mesh
         )
 
         critic = get_llm_for_sequence_regression(
@@ -409,7 +409,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
 
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         use_meta = should_use_meta_init(
-            use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
+            use_meta_tensor=False, mesh=self.strategy.device_mesh
         )
 
         wrapped_model = HFModelWrapper(
