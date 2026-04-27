@@ -168,17 +168,15 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         use_meta = should_use_meta_init(
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
         )
-        # gpt-oss: force every rank through `from_pretrained` (no meta-init)
-        # so `fsdp2_load_full_state_dict` can take its no-NCCL fast path
-        # (each rank computes its local shard from its own materialized
-        # state_dict).  Pair with `bf16=True` so the dequantized model fits
-        # 8x in CPU RAM (gpt-oss-120b: 117 GB bf16 vs 234 GB fp32; 8 actors
-        # × 117 GB ≈ 936 GB ⊂ 1.76 TB H200 host RAM).  FSDP2's
-        # MixedPrecisionPolicy already casts to bf16 for forward/backward,
-        # so this only changes the optimizer master dtype.
+        # gpt-oss: keep rank-0-only materialization (default `use_meta`) so
+        # only one actor per node holds the dequantized bf16 model on CPU
+        # (~117 GB for 120b) — vs ~936 GB if all 8 actors materialize, which
+        # OOMs the 1.76 TB H200 host.  Use bf16 storage to halve the per-
+        # rank shard cost and the per-key broadcast bandwidth.  The
+        # standard rank-0 broadcast loop in fsdp2_load_full_state_dict
+        # runs intra-node over NVLink/IPC (no inter-node NCCL plugin
+        # needed), which is fast on a 1-node deployment.
         is_gpt_oss = getattr(model_config, "model_type", "") == "gpt_oss"
-        if is_gpt_oss:
-            use_meta = False
 
         wrapped_model = HFModelWrapper(
             model_path,
