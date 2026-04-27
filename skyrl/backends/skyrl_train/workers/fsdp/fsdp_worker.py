@@ -168,6 +168,18 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         use_meta = should_use_meta_init(
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
         )
+        # Some quantization-aware models (e.g. gpt-oss MXFP4) produce a
+        # different state-dict layout from `from_pretrained` versus
+        # `from_config`-on-meta.  When that happens the per-param NCCL
+        # broadcast in `fsdp2_load_full_state_dict` desynchronizes (rank
+        # 0 issues N broadcasts while non-zero ranks expect M ≠ N) and
+        # `init_model` hangs on the NCCL watchdog.  Setting
+        # `force_full_init_on_all_ranks: true` in the policy model config
+        # forces every rank through `from_pretrained` so the layouts agree;
+        # the broadcast loop is skipped automatically by the fast path in
+        # `fsdp2_load_full_state_dict` once every rank has materialized.
+        if getattr(self.cfg.policy.model, "force_full_init_on_all_ranks", False):
+            use_meta = False
 
         wrapped_model = HFModelWrapper(
             model_path,

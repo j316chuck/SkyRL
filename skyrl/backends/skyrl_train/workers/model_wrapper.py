@@ -128,6 +128,30 @@ class HFModelWrapper(nn.Module):
                 model_config.rope_theta = rope_theta
             model_config._attn_implementation = self.attn_implementation
 
+            # Model-specific override: gpt-oss MXFP4 ships a non-differentiable
+            # `Mxfp4GptOssExperts` (custom triton matmul without an
+            # autograd backward), which silently freezes the entire MoE
+            # forward path during RL.  Forcing `Mxfp4Config(dequantize=True)`
+            # makes `from_pretrained` build the regular bf16 `GptOssExperts`
+            # so gradients flow through the experts.  Pair with
+            # `low_cpu_mem_usage=True` because the dequantized 120b is
+            # ~234 GB and the default load path would keep two copies in
+            # CPU RAM per rank.
+            extra_quant_config = nf4_config
+            extra_from_pretrained_kwargs: dict = {}
+            if (
+                getattr(model_config, "model_type", "") == "gpt_oss"
+                and not meta_init
+                and extra_quant_config is None
+            ):
+                try:
+                    from transformers import Mxfp4Config
+
+                    extra_quant_config = Mxfp4Config(dequantize=True)
+                    extra_from_pretrained_kwargs["low_cpu_mem_usage"] = True
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(f"[gpt_oss] Mxfp4Config unavailable: {exc}")
+
             if meta_init:
                 with torch.device("meta"):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
@@ -138,9 +162,10 @@ class HFModelWrapper(nn.Module):
                     config=model_config,
                     trust_remote_code=True,
                     attn_implementation=self.attn_implementation,
-                    quantization_config=nf4_config,
+                    quantization_config=extra_quant_config,
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                     device_map=device_map,
+                    **extra_from_pretrained_kwargs,
                 )
 
             # gpt oss
@@ -195,12 +220,16 @@ class HFModelWrapper(nn.Module):
             # MoE - balancing loss
             model_config = self.model.config.to_dict()
             if "output_router_logits" in model_config:
-                # Skip for granitemoehybrid: its decoder layers don't return router
-                # logits, so enabling this flag causes an IndexError in
-                # load_balancing_loss_func when it tries to access empty gate_logits.
-                if model_config.get("model_type") == "granitemoehybrid":
+                # Skip for known model types whose decoder layers don't actually
+                # return router logits — enabling the flag would cause an
+                # IndexError in `load_balancing_loss_func` when it indexes the
+                # empty `gate_logits` tuple.
+                # - granitemoehybrid: decoder layers don't return router logits
+                # - gpt_oss: forward returns an empty router_logits tuple in
+                #   our supported transformers version
+                if model_config.get("model_type") in ("granitemoehybrid", "gpt_oss"):
                     logger.info(
-                        "[MoE] granitemoehybrid detected, skipping output_router_logits (decoder layers don't return router logits)"
+                        f"[MoE] {model_config.get('model_type')} detected, skipping output_router_logits"
                     )
                 else:
                     logger.info("[MoE] set output_router_logits as True")
