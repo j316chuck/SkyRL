@@ -3,12 +3,14 @@
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/actor.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/model.py
 
+import contextlib
 from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import transformers
+from accelerate import init_empty_weights
 from flash_attn.bert_padding import pad_input, unpad_input
 from loguru import logger
 from packaging.version import Version
@@ -31,6 +33,51 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
 )
+
+
+@contextlib.contextmanager
+def _nullctx():
+    yield
+
+
+@contextlib.contextmanager
+def _gpu_mxfp4_dequantize():
+    """Run `transformers.integrations.mxfp4._convert_moe_packed_tensors` on GPU.
+
+    `from_pretrained(..., quantization_config=Mxfp4Config(dequantize=True))`
+    runs the FP4 → bf16 conversion via a Python LUT loop in
+    `_convert_moe_packed_tensors`.  When the input blocks/scales are on CPU
+    (default `device_map=None`), each layer's expert weights produce ~70 GB of
+    int32 + bf16 traffic on a single CPU thread — about 4-5 s per state-dict
+    key, ~40 minutes total for gpt-oss-120b.
+
+    Move the inputs to the current CUDA device before conversion and the
+    output back to CPU after.  GPU bandwidth is ~30× CPU's, so the per-key
+    cost drops from ~5 s to ~150 ms.  The result still lands on CPU, so the
+    host-RAM footprint of `from_pretrained` (and the downstream FSDP2
+    sharding path) is unchanged.
+    """
+    from transformers.integrations import mxfp4 as _mxfp4
+
+    original = _mxfp4.convert_moe_packed_tensors
+
+    def _patched(blocks, scales, *, dtype=torch.bfloat16, **kwargs):
+        if blocks.device.type == "cpu" and torch.cuda.is_available():
+            cuda = torch.device("cuda", torch.cuda.current_device())
+            out = original(
+                blocks.to(cuda, non_blocking=True),
+                scales.to(cuda, non_blocking=True),
+                dtype=dtype,
+                **kwargs,
+            )
+            return out.to("cpu", non_blocking=True)
+        return original(blocks, scales, dtype=dtype, **kwargs)
+
+    _mxfp4.convert_moe_packed_tensors = _patched
+    try:
+        yield
+    finally:
+        _mxfp4.convert_moe_packed_tensors = original
 
 
 class HFModelWrapper(nn.Module):
@@ -128,20 +175,48 @@ class HFModelWrapper(nn.Module):
                 model_config.rope_theta = rope_theta
             model_config._attn_implementation = self.attn_implementation
 
+            # gpt-oss ships with MXFP4-packed expert weights.  By default
+            # `from_pretrained` builds `Mxfp4GptOssExperts`, whose state_dict
+            # layout differs from the bf16 `GptOssExperts` that meta-init
+            # produces (543 keys vs 615 — the 72-key gap is the unpacked
+            # `gate_up_proj` / `down_proj` per layer).  That mismatch causes
+            # `fsdp2_load_full_state_dict` (which broadcasts each parameter
+            # from rank 0 to ranks 1+) to desynchronize NCCL — rank 0 issues
+            # 543 broadcasts while ranks 1+ expect 615 — and `create_model`
+            # hangs on the watchdog timeout.  `Mxfp4GptOssExperts` also calls
+            # non-differentiable triton kernels, blocking RL gradient flow
+            # through the MoE.  `Mxfp4Config(dequantize=True)` rebuilds rank
+            # 0's experts as bf16 `GptOssExperts`, which matches meta-init's
+            # layout and is autograd-friendly.
+            quantization_config = nf4_config
+            is_gpt_oss = getattr(model_config, "model_type", "") == "gpt_oss"
+            if quantization_config is None and is_gpt_oss:
+                from transformers import Mxfp4Config
+
+                quantization_config = Mxfp4Config(dequantize=True)
+                logger.info("[gpt_oss] using Mxfp4Config(dequantize=True) for from_pretrained")
+
             if meta_init:
-                with torch.device("meta"):
+                with init_empty_weights():
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
                 self.model.to(torch.bfloat16 if bf16 else torch.float32)
             else:
-                self.model = model_class.from_pretrained(
-                    pretrain_or_model,
-                    config=model_config,
-                    trust_remote_code=True,
-                    attn_implementation=self.attn_implementation,
-                    quantization_config=nf4_config,
-                    torch_dtype=torch.bfloat16 if bf16 else torch.float32,
-                    device_map=device_map,
-                )
+                # gpt-oss MXFP4 dequantize on CPU is single-threaded and dominated
+                # by ~70 GB of int32/bf16 LUT lookups + scale shifts per layer; on
+                # a 120B model that's ~40 minutes at typical CPU bandwidth.  Run
+                # the dequantize on the rank's GPU instead — the resulting bf16
+                # tensor is moved straight back to CPU so the host-RAM footprint
+                # is unchanged but the per-key cost drops ~30×.
+                with _gpu_mxfp4_dequantize() if is_gpt_oss and torch.cuda.is_available() else _nullctx():
+                    self.model = model_class.from_pretrained(
+                        pretrain_or_model,
+                        config=model_config,
+                        trust_remote_code=True,
+                        attn_implementation=self.attn_implementation,
+                        quantization_config=quantization_config,
+                        torch_dtype=torch.bfloat16 if bf16 else torch.float32,
+                        device_map=device_map,
+                    )
 
             # gpt oss
             if Version(transformers.__version__) >= Version("4.56.2"):
@@ -195,12 +270,17 @@ class HFModelWrapper(nn.Module):
             # MoE - balancing loss
             model_config = self.model.config.to_dict()
             if "output_router_logits" in model_config:
-                # Skip for granitemoehybrid: its decoder layers don't return router
-                # logits, so enabling this flag causes an IndexError in
-                # load_balancing_loss_func when it tries to access empty gate_logits.
-                if model_config.get("model_type") == "granitemoehybrid":
+                # Skip for models whose decoder layers don't actually populate
+                # `router_logits` in `MoeModelOutputWithPast`.  Enabling the
+                # flag then trips an IndexError inside `load_balancing_loss_func`
+                # when it indexes the empty router_logits tuple.
+                #   - granitemoehybrid: decoder layers return no router logits.
+                #   - gpt_oss: same — `output_router_logits` is not plumbed
+                #     through transformers' GptOss forward path.
+                if model_config.get("model_type") in ("granitemoehybrid", "gpt_oss"):
                     logger.info(
-                        "[MoE] granitemoehybrid detected, skipping output_router_logits (decoder layers don't return router logits)"
+                        f"[MoE] {model_config.get('model_type')} detected, "
+                        "skipping output_router_logits"
                     )
                 else:
                     logger.info("[MoE] set output_router_logits as True")
