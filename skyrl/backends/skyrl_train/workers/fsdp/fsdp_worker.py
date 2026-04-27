@@ -168,11 +168,24 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         use_meta = should_use_meta_init(
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
         )
+        # gpt-oss: force every rank through `from_pretrained` (no meta-init)
+        # so that `fsdp2_load_full_state_dict` can take its fast, no-NCCL
+        # path (each rank computes its local shard from its own materialized
+        # state_dict via `distribute_tensor`).  Pair with `bf16=True` below
+        # so the dequantized model fits ~8x in CPU RAM (gpt-oss-120b: 117 GB
+        # bf16 vs 234 GB fp32; 8 actors/node × 117 GB ≈ 936 GB ⊂ 1.76 TB).
+        # The MixedPrecisionPolicy used by FSDP2 already casts to bf16 for
+        # forward/backward, so storing bf16 master weights doesn't change the
+        # forward dtype; it only changes the optimizer master dtype, which is
+        # acceptable for a short RL run (and matches Tinker's gpt-oss path).
+        is_gpt_oss = getattr(model_config, "model_type", "") == "gpt_oss"
+        if is_gpt_oss:
+            use_meta = False
 
         wrapped_model = HFModelWrapper(
             model_path,
             use_flash_attention_2=self.cfg.flash_attn,
-            bf16=False,
+            bf16=is_gpt_oss,
             lora_rank=self.cfg.policy.model.lora.rank,
             lora_alpha=self.cfg.policy.model.lora.alpha,
             lora_dropout=self.cfg.policy.model.lora.dropout,

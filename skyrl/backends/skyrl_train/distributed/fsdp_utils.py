@@ -315,7 +315,52 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             tensor = tensor.contiguous()
         return tensor
 
-    if dist.get_rank() == 0:
+    # Fast path: if every rank already has a materialized full state_dict
+    # (e.g. when meta-init is disabled and every rank ran `from_pretrained`),
+    # we can compute each local shard from the rank's own copy of the
+    # tensor via `distribute_tensor` — no NCCL broadcast needed.  This
+    # avoids the per-key broadcast loop (which is fragile on clusters
+    # without a working NCCL net plugin and serializes O(num_params)
+    # collectives even when it works).  All ranks must agree on the path
+    # or we deadlock, so we MIN-reduce a "materialized" flag.
+    rank_full_sd_materialized = int(
+        len(full_sd) > 0 and all(not p.is_meta for p in full_sd.values())
+    )
+    flag = torch.tensor(
+        [rank_full_sd_materialized], device=torch.cuda.current_device(), dtype=torch.int32
+    )
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    full_sd_is_materialized = bool(flag.item())
+
+    if full_sd_is_materialized:
+        # Agree on the iteration order across ranks (rank-0's keys), then
+        # each rank shards its own tensor locally.
+        rank0_keys: list[str] = list(full_sd.keys()) if dist.get_rank() == 0 else []
+        keys_holder = [rank0_keys]
+        dist.broadcast_object_list(keys_holder, src=0)
+        for param_name in keys_holder[0]:
+            sharded_param = meta_sharded_sd.get(param_name)
+            if sharded_param is None:
+                continue
+            full_param = full_sd.get(param_name)
+            if full_param is None:
+                full_param = torch.zeros(
+                    sharded_param.size(), device="cuda", dtype=sharded_param.dtype
+                )
+            else:
+                full_param = full_param.detach().cuda()
+                if full_param.dtype != sharded_param.dtype:
+                    full_param = full_param.to(dtype=sharded_param.dtype)
+            mesh = sharded_param.device_mesh
+            sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
+            to_contiguous, casting_dtype = _infer_parameter_dtype(
+                model,
+                param_name,
+                full_param,
+            )
+            sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
+            sharded_sd[param_name] = sharded_tensor
+    elif dist.get_rank() == 0:
         for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
             full_param = full_param.detach().cuda()
             mesh = sharded_param.device_mesh
