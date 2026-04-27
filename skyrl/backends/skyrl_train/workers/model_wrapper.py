@@ -33,6 +33,56 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
 )
 
 
+def _estimate_bf16_size_bytes(model_path_or_id: str) -> int:
+  """Return an estimate of the dequantized-bf16 model size in bytes.
+
+  Walks HF safetensors index for `model_path_or_id` (works for both a local
+  directory and a hub id by going through the local HF cache). Returns 0 if
+  we can't tell, in which case the caller should not assume the model fits
+  on a single GPU.
+  """
+  import json
+  import os
+
+  candidate_dirs: list[str] = []
+  if os.path.isdir(model_path_or_id):
+    candidate_dirs.append(model_path_or_id)
+  else:
+    try:
+      from huggingface_hub import snapshot_download
+
+      candidate_dirs.append(
+        snapshot_download(model_path_or_id, allow_patterns=["*.json"], local_files_only=True)
+      )
+    except Exception:
+      return 0
+
+  for d in candidate_dirs:
+    index_path = os.path.join(d, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+      continue
+    try:
+      with open(index_path) as f:
+        idx = json.load(f)
+    except Exception:
+      return 0
+    metadata = idx.get("metadata") or {}
+    total = metadata.get("total_size")
+    if isinstance(total, int) and total > 0:
+      # If the underlying weights are MXFP4 (gpt-oss case), bf16 dequant is
+      # ~4x larger than the on-disk packed FP4 size.
+      cfg_path = os.path.join(d, "config.json")
+      try:
+        cfg = json.load(open(cfg_path))
+        qcfg = cfg.get("quantization_config") or {}
+        if str(qcfg.get("quant_method", "")).lower() == "mxfp4":
+          total = total * 4
+      except Exception:
+        pass
+      return int(total)
+  return 0
+
+
 class HFModelWrapper(nn.Module):
     """
     Base class for wrapped HF models in reinforcement learning.
@@ -138,27 +188,31 @@ class HFModelWrapper(nn.Module):
                 from transformers import Mxfp4Config
 
                 quant_config = Mxfp4Config(dequantize=True)
-                # Route the dequant onto the local rank's GPU instead of host
-                # RAM. CPU dequant is ~40 minutes for gpt-oss-120b on a 6-rank
-                # FSDP setup; doing it on the GPU and letting FSDP re-shard
-                # right after brings that down by ~10x. For models too large
-                # to fit on one GPU (e.g. 120b dequantized = ~240GB) we cap
-                # the GPU memory so HF spills the overflow to CPU.
+                # Route the dequant onto the local rank's GPU when the full
+                # dequantized model fits, instead of host RAM. CPU dequant is
+                # ~40 min for gpt-oss-120b on a 6-rank FSDP setup; doing it on
+                # the GPU and letting FSDP re-shard right after brings that
+                # down by ~10x for the 20b case. For models too large to fit
+                # on one GPU (e.g. 120b dequantized = ~240GB > one H200's
+                # 144GB), we stay on the CPU dequant path: HF accelerate's
+                # CPU-spill via max_memory leaves params on a meta/disk device
+                # that SkyRL's fsdp2_load_full_state_dict can't handle
+                # (`.cuda()` raises "Cannot copy out of meta tensor").
                 if device_map is None and torch.cuda.is_available():
                     cur = torch.cuda.current_device()
                     free_b, _ = torch.cuda.mem_get_info(cur)
-                    free_gib = max(int(free_b // (1024**3)) - 8, 8)
-                    load_device_map = "auto"
-                    kwargs.setdefault("max_memory", {cur: f"{free_gib}GiB", "cpu": "1500GiB"})
+                    # Use a simple bf16-size estimate from the safetensors
+                    # checkpoint shards on disk; this dominates over python
+                    # overhead during from_pretrained materialization.
+                    needed = _estimate_bf16_size_bytes(pretrain_or_model)
+                    if needed > 0 and free_b > int(needed * 1.15):
+                        load_device_map = {"": cur}
 
             if meta_init:
                 with torch.device("meta"):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
                 self.model.to(torch.bfloat16 if bf16 else torch.float32)
             else:
-                from_pretrained_kwargs = {}
-                if "max_memory" in kwargs:
-                    from_pretrained_kwargs["max_memory"] = kwargs.pop("max_memory")
                 self.model = model_class.from_pretrained(
                     pretrain_or_model,
                     config=model_config,
@@ -167,7 +221,6 @@ class HFModelWrapper(nn.Module):
                     quantization_config=quant_config,
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                     device_map=load_device_map,
-                    **from_pretrained_kwargs,
                 )
 
             # gpt oss
