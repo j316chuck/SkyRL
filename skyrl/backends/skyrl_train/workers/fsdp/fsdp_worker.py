@@ -168,20 +168,11 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         use_meta = should_use_meta_init(
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
         )
-        # gpt-oss: keep rank-0-only materialization (default `use_meta`) so
-        # only one actor per node holds the dequantized bf16 model on CPU
-        # (~117 GB for 120b) — vs ~936 GB if all 8 actors materialize, which
-        # OOMs the 1.76 TB H200 host.  Use bf16 storage to halve the per-
-        # rank shard cost and the per-key broadcast bandwidth.  The
-        # standard rank-0 broadcast loop in fsdp2_load_full_state_dict
-        # runs intra-node over NVLink/IPC (no inter-node NCCL plugin
-        # needed), which is fast on a 1-node deployment.
-        is_gpt_oss = getattr(model_config, "model_type", "") == "gpt_oss"
 
         wrapped_model = HFModelWrapper(
             model_path,
             use_flash_attention_2=self.cfg.flash_attn,
-            bf16=is_gpt_oss,
+            bf16=False,
             lora_rank=self.cfg.policy.model.lora.rank,
             lora_alpha=self.cfg.policy.model.lora.alpha,
             lora_dropout=self.cfg.policy.model.lora.dropout,
