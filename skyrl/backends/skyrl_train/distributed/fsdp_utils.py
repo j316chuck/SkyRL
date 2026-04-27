@@ -370,8 +370,18 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
                             device=local.device,
                         )
             local = local.cuda(non_blocking=True)
+            # `from_local` requires both shape and stride together; use the
+            # full tensor's contiguous stride (we just chunked it).
+            full_stride = tuple(
+                int(s) for s in torch.empty(full_shape, dtype=local.dtype, device="meta").stride()
+            )
             sharded_tensor = DTensor.from_local(
-                local, mesh, placements, run_check=False, shape=torch.Size(full_shape)
+                local,
+                mesh,
+                placements,
+                run_check=False,
+                shape=torch.Size(full_shape),
+                stride=full_stride,
             )
             to_contiguous, casting_dtype = _infer_parameter_dtype(
                 model,
