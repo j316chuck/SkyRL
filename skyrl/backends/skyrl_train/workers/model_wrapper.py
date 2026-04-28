@@ -128,19 +128,80 @@ class HFModelWrapper(nn.Module):
                 model_config.rope_theta = rope_theta
             model_config._attn_implementation = self.attn_implementation
 
+            # WORKAROUND: gpt_oss ships in MXFP4.  The default load path uses
+            # `Mxfp4GptOssExperts`, which calls non-differentiable triton
+            # `matmul_ogs` kernels — gradient cannot flow back through the
+            # MoE forward.  Forcing `Mxfp4Config(dequantize=True)` makes
+            # `from_pretrained` use the regular `GptOssExperts` (autograd-
+            # friendly bf16) so RL gradient actually moves the policy.
+            # Pair this with `use_meta=False` in `fsdp_worker.py` so every
+            # rank loads independently (skipping the per-key NCCL broadcast
+            # in `fsdp2_load_full_state_dict`, which is the FSDP2 init
+            # bottleneck on a 20-120B fully-bf16 model).
+            extra_quant_config = nf4_config
+            if (
+                getattr(model_config, "model_type", "") == "gpt_oss"
+                and not meta_init
+                and extra_quant_config is None
+            ):
+                src_quant = getattr(model_config, "quantization_config", None)
+                src_quant_method = (
+                    getattr(src_quant, "quant_method", None)
+                    if src_quant is not None
+                    else None
+                )
+                if src_quant_method is None and isinstance(src_quant, dict):
+                    src_quant_method = src_quant.get("quant_method")
+                if src_quant_method == "mxfp4":
+                    try:
+                        from transformers import Mxfp4Config
+
+                        extra_quant_config = Mxfp4Config(dequantize=True)
+                        logger.info(
+                            "[gpt_oss workaround] passing Mxfp4Config(dequantize=True) "
+                            "to from_pretrained so the differentiable GptOssExperts "
+                            "path is used instead of Mxfp4GptOssExperts"
+                        )
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning(
+                            f"[gpt_oss workaround] Mxfp4Config import failed: {exc}"
+                        )
+                else:
+                    logger.info(
+                        "[gpt_oss workaround] source model has no MXFP4 quantization "
+                        f"(quant_method={src_quant_method!r}); skipping Mxfp4Config "
+                        "(assuming pre-dequantized BF16 mirror, e.g. unsloth/gpt-oss-120b-BF16)"
+                    )
+
             if meta_init:
                 with torch.device("meta"):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
                 self.model.to(torch.bfloat16 if bf16 else torch.float32)
             else:
-                self.model = model_class.from_pretrained(
-                    pretrain_or_model,
+                # WORKAROUND: for gpt_oss with `Mxfp4Config(dequantize=True)`,
+                # the dequantized bf16 model is huge (~234 GB for 120b).  When
+                # 8 ranks per node each call from_pretrained independently,
+                # the node's CPU RAM gets exhausted (8 × 200 GB > 1.7 TB).
+                # `low_cpu_mem_usage=True` makes from_pretrained load weights
+                # tensor-by-tensor onto GPU, freeing CPU buffers as it goes.
+                from_pretrained_kwargs = dict(
+                    pretrain_or_model=pretrain_or_model,
                     config=model_config,
                     trust_remote_code=True,
                     attn_implementation=self.attn_implementation,
-                    quantization_config=nf4_config,
+                    quantization_config=extra_quant_config,
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                     device_map=device_map,
+                )
+                if getattr(model_config, "model_type", "") == "gpt_oss":
+                    from_pretrained_kwargs["low_cpu_mem_usage"] = True
+                # `from_pretrained_kwargs` was authored to avoid duplicating
+                # the call signature; pop the key we use as the positional
+                # arg below.
+                pretrained_path = from_pretrained_kwargs.pop("pretrain_or_model")
+                self.model = model_class.from_pretrained(
+                    pretrained_path,
+                    **from_pretrained_kwargs,
                 )
 
             # gpt oss
@@ -181,6 +242,44 @@ class HFModelWrapper(nn.Module):
                     init_lora_weights=True if lora_init_method == "kaiming" else lora_init_method,
                 )
                 self.model = get_peft_model(self.model, lora_config)
+                # Diagnostic: surface trainable LoRA param counts so a
+                # miscount due to target_modules not matching is immediately
+                # visible in the engine log.
+                try:
+                    self.model.print_trainable_parameters()
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(f"[lora] print_trainable_parameters failed: {exc}")
+
+                # WORKAROUND for gpt-oss-120b/20b: the experts live inside a
+                # custom `Mxfp4GptOssExperts` module (no nn.Linear), and the
+                # router lives inside a custom `GptOssTopKRouter` module (also
+                # not nn.Linear).  Default LoRA target_modules="all-linear"
+                # therefore only adapts the attention projections and lm_head
+                # (~2.17B / ~120B = ~1.8% of params, ~6M LoRA params), which
+                # leaves the entire MoE routing decision frozen and the model
+                # can't actually learn from RL signal.  Mark the router weight
+                # and bias on every layer as trainable so the policy can move
+                # gate logits directly.  This adds ~36 layers * (128*2880 +
+                # 128) ≈ 13M raw trainable params alongside the LoRA adapters.
+                model_type = (
+                    self.model.config.model_type
+                    if hasattr(self.model, "config") and hasattr(self.model.config, "model_type")
+                    else None
+                )
+                # NOTE: Earlier we also flipped requires_grad=True on the
+                # GptOssTopKRouter weights and Mxfp4GptOssExperts biases for
+                # gpt_oss.  That dramatically slowed FSDP2 init (19B+
+                # trainable params on a 20B model means the FSDP wrap +
+                # state-dict broadcast scales up by ~3000× vs the 6M LoRA-
+                # only path) and the test never reached forward_backward
+                # within the 1h NCCL watchdog window.  We rely on the
+                # `Mxfp4Config(dequantize=True)` change above to make the
+                # MoE forward path differentiable through autograd, so
+                # gradient still flows back through the expert outputs to
+                # the attention LoRA adapters even though the experts
+                # themselves remain frozen.  If the policy needs to update
+                # routing decisions directly, we can opt these in later
+                # behind a config flag.
 
                 if load_in_4bit:
                     for name, module in self.model.named_modules():
@@ -198,9 +297,16 @@ class HFModelWrapper(nn.Module):
                 # Skip for granitemoehybrid: its decoder layers don't return router
                 # logits, so enabling this flag causes an IndexError in
                 # load_balancing_loss_func when it tries to access empty gate_logits.
-                if model_config.get("model_type") == "granitemoehybrid":
+                if model_config.get("model_type") in ("granitemoehybrid", "gpt_oss"):
+                    # granitemoehybrid: decoder layers don't return router logits.
+                    # gpt_oss: load_balancing_loss_func IndexErrors with our
+                    # transformers version when output_router_logits is True (the
+                    # forward returns an empty router_logits tuple).  See WORKAROUND
+                    # in fsdp_worker.py.  Skipping is safe — RL fine-tuning here
+                    # doesn't use the router auxiliary loss.
                     logger.info(
-                        "[MoE] granitemoehybrid detected, skipping output_router_logits (decoder layers don't return router logits)"
+                        f"[MoE] {model_config.get('model_type')} detected, skipping "
+                        "output_router_logits"
                     )
                 else:
                     logger.info("[MoE] set output_router_logits as True")

@@ -168,6 +168,25 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         use_meta = should_use_meta_init(
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
         )
+        # WORKAROUND: gpt-oss ships in MXFP4.  rank-0 `from_pretrained`
+        # produces the `Mxfp4GptOssExperts` layout (831 keys for 120b),
+        # while non-zero ranks doing meta-init via `from_config` produce a
+        # different layout (903 keys for 120b).  That mismatch causes
+        # `fsdp2_load_full_state_dict` to issue different numbers of
+        # broadcasts on different ranks and `create_model` hangs on the
+        # NCCL watchdog.  Forcing `use_meta=False` so every rank takes the
+        # same `from_pretrained` path keeps the layouts identical.
+        if getattr(model_config, "model_type", "") == "gpt_oss":
+            src_quant = getattr(model_config, "quantization_config", None)
+            src_quant_method = (
+                getattr(src_quant, "quant_method", None)
+                if src_quant is not None
+                else None
+            )
+            if src_quant_method is None and isinstance(src_quant, dict):
+                src_quant_method = src_quant.get("quant_method")
+            if src_quant_method == "mxfp4":
+                use_meta = False
 
         wrapped_model = HFModelWrapper(
             model_path,
@@ -194,12 +213,39 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 gradient_checkpointing_kwargs={"use_reentrant": self.cfg.gradient_checkpointing_use_reentrant}
             )
 
+        # DIAGNOSTIC: count trainable params on the wrapped model BEFORE
+        # FSDP wraps it, so we know what the optimizer is going to see.
+        n_trainable_pre = sum(
+            p.numel() for p in wrapped_model.model.parameters() if p.requires_grad
+        )
+        n_total_pre = sum(p.numel() for p in wrapped_model.model.parameters())
+        print(
+            f"[fsdp_worker] pre-FSDP trainable params = {n_trainable_pre} / {n_total_pre} "
+            f"({100.0 * n_trainable_pre / max(n_total_pre, 1):.4f}%)",
+            flush=True,
+        )
         self.model, self.optimizer, self.scheduler = strategy.prepare(
             (wrapped_model, None, None),
         )
         assert (
             self.optimizer is not None and self.scheduler is not None
         ), "FSDP preparation should create optimizer and scheduler"
+        # DIAGNOSTIC: count trainable params after FSDP wrap and the params
+        # actually held by the optimizer.
+        n_trainable_post = sum(
+            p.numel() for p in self.model.model.parameters() if p.requires_grad
+        )
+        n_optim = sum(
+            p.numel()
+            for group in self.optimizer.param_groups
+            for p in group["params"]
+            if p.requires_grad
+        )
+        print(
+            f"[fsdp_worker] post-FSDP trainable params = {n_trainable_post}, "
+            f"optimizer trainable params = {n_optim}",
+            flush=True,
+        )
 
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
         # Call super first to set _transfer_strategy_cls and create sender/receivers
