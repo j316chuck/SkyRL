@@ -217,6 +217,11 @@ class HFModelWrapper(nn.Module):
                     and extra_quant_config is not None
                 ):
                     from_pretrained_kwargs["low_cpu_mem_usage"] = True
+                # Same memory-pressure workaround for Qwen3.5 (text + MoE).
+                # Qwen3.5-397B-A17B is ~803 GB BF16 — 8 ranks per node each
+                # materializing the full state dict OOMs the 1.7 TB host RAM.
+                if getattr(model_config, "model_type", "") in ("qwen3_5", "qwen3_5_moe"):
+                    from_pretrained_kwargs["low_cpu_mem_usage"] = True
                 # `from_pretrained_kwargs` was authored to avoid duplicating
                 # the call signature; pop the key we use as the positional
                 # arg below.
