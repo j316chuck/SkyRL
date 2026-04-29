@@ -131,6 +131,15 @@ class HFModelWrapper(nn.Module):
                     "VLM checkpoint stays but forward uses 1D position_ids"
                 )
                 self.is_vlm = False
+                # WORKAROUND: Qwen3.5 Gated Attention has head_dim=256.  flash-attn
+                # 2.8.x's varlen path on H200 hits an illegal memory access at this
+                # shape; SDPA is the safer default for RL forward passes.
+                if self.attn_implementation == "flash_attention_2" and not use_sample_packing:
+                    logger.info(
+                        "[qwen3_5 workaround] switching attn_implementation "
+                        "flash_attention_2 -> sdpa (head_dim=256 + flash-attn 2.8.x crashes)"
+                    )
+                    self.attn_implementation = "sdpa"
 
             if self.is_vlm:
                 logger.info(
