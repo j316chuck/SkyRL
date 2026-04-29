@@ -114,12 +114,37 @@ class HFModelWrapper(nn.Module):
             model_config = AutoConfig.from_pretrained(pretrain_or_model, trust_remote_code=True, **model_config_kwargs)
 
             self.is_vlm = hasattr(model_config, "vision_config") and getattr(model_config, "vision_config") is not None
+
+            # WORKAROUND: Qwen3.5 ships as `Qwen3_5ForConditionalGeneration` (a
+            # VLM with `vision_config`), but for text-only RL we never feed
+            # `pixel_values`.  SkyRL's VLM forward branch
+            # (`HFModelWrapper.forward` when `is_vlm=True`) passes
+            # `position_ids=None` and asserts `not use_sample_packing`, which
+            # routes Qwen3.5 through 3D positional-id code that crashes with a
+            # CUDA illegal memory access.  Keep loading the VLM checkpoint
+            # (so weight keys match) but disable the VLM forward branch so
+            # `forward(pixel_values=None)` flows through the standard text
+            # path with computed 1D `position_ids`.
+            if self.is_vlm and getattr(model_config, "model_type", "") == "qwen3_5":
+                logger.info(
+                    "[qwen3_5 workaround] forcing is_vlm=False on text-only RL; "
+                    "VLM checkpoint stays but forward uses 1D position_ids"
+                )
+                self.is_vlm = False
+
             if self.is_vlm:
                 logger.info(
                     f"[VLM] Config {type(model_config).__name__} has a vision config, "
                     "using AutoModelForImageTextToText"
                 )
                 # NOTE: In future transformers releases (> 5.0.0), all multimodal models can use AutoModelForMultimodalLM.
+                model_class = AutoModelForImageTextToText
+            elif (
+                hasattr(model_config, "vision_config")
+                and getattr(model_config, "vision_config") is not None
+            ):
+                # Non-`is_vlm` VLM (qwen3_5 above): still need `AutoModelForImageTextToText`
+                # so checkpoint keys (`model.language_model.*`) load correctly.
                 model_class = AutoModelForImageTextToText
 
             if rope_scaling:
