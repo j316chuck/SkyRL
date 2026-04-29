@@ -178,15 +178,6 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         # same `from_pretrained` path keeps the layouts identical.
         if getattr(model_config, "model_type", "") == "gpt_oss":
             use_meta = False
-        # Same workaround for Qwen3.5-397B-A17B (qwen3_5_moe): per-key NCCL
-        # broadcast in `fsdp2_load_full_state_dict` hangs forever (>2 hours)
-        # when only rank 0 has materialized weights and 15 other ranks are on
-        # meta.  Forcing every rank through `from_pretrained` with
-        # `low_cpu_mem_usage=True` keeps the layouts identical and lets FSDP2
-        # skip the broadcast.  The base model is cached locally after first
-        # download so this isn't a network bottleneck.
-        if getattr(model_config, "model_type", "") in ("qwen3_5", "qwen3_5_moe"):
-            use_meta = False
 
         wrapped_model = HFModelWrapper(
             model_path,
