@@ -225,6 +225,36 @@ class HFModelWrapper(nn.Module):
                     **from_pretrained_kwargs,
                 )
 
+            # WORKAROUND: Qwen3.5 RMSNorm `forward` returns
+            # `output * (1.0 + self.weight.float())`.  With FSDP2 + LoRA, frozen
+            # `self.weight` stays as a `DTensor` inside forward (it's not in
+            # the LoRA trainable set, so FSDP2 doesn't always all-gather it
+            # back to a plain Tensor before forward), and multiplying that with
+            # the regular `Tensor` activation crashes:
+            # `aten.mul.Tensor got mixed torch.Tensor and DTensor`.  Patch the
+            # forward to materialize the weight to a regular tensor when it's a
+            # DTensor.
+            if getattr(self.model.config, "model_type", "") == "qwen3_5":
+                try:
+                    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+                    from torch.distributed.tensor import DTensor
+
+                    def _patched_qwen3_5_rmsnorm_forward(self, x):
+                        output = self._norm(x.float())
+                        weight = self.weight
+                        if isinstance(weight, DTensor):
+                            weight = weight.full_tensor()
+                        output = output * (1.0 + weight.float())
+                        return output.type_as(x)
+
+                    Qwen3_5RMSNorm.forward = _patched_qwen3_5_rmsnorm_forward
+                    logger.info(
+                        "[qwen3_5 workaround] patched Qwen3_5RMSNorm.forward to "
+                        "materialize DTensor weight before mul"
+                    )
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(f"[qwen3_5 workaround] RMSNorm patch failed: {exc}")
+
             # gpt oss
             if Version(transformers.__version__) >= Version("4.56.2"):
                 from transformers import GptOssConfig
