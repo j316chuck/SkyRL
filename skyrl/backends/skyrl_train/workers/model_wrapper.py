@@ -113,7 +113,31 @@ class HFModelWrapper(nn.Module):
 
             model_config = AutoConfig.from_pretrained(pretrain_or_model, trust_remote_code=True, **model_config_kwargs)
 
-            self.is_vlm = hasattr(model_config, "vision_config") and getattr(model_config, "vision_config") is not None
+            # WORKAROUND: Qwen3.5 ships as `Qwen3_5{Moe,}ForConditionalGeneration`
+            # with a `vision_config`, but text-only RL doesn't need the vision tower.
+            # Drop `vision_config` and reroute model_type to the text variant so the
+            # default `AutoModelForCausalLM` path picks `Qwen3_5{Moe,}ForCausalLM`.
+            qwen35_text_only = getattr(model_config, "model_type", "") in (
+                "qwen3_5",
+                "qwen3_5_moe",
+            ) and hasattr(model_config, "text_config")
+            if qwen35_text_only:
+                text_cfg = getattr(model_config, "text_config")
+                # Preserve attn_implementation override that gets applied below.
+                base_attn = getattr(model_config, "_attn_implementation", None)
+                model_config = text_cfg
+                if base_attn is not None:
+                    model_config._attn_implementation = base_attn
+                logger.info(
+                    f"[qwen3.5 text-only workaround] dropping vision_config, "
+                    f"using text-only Qwen3_5* model_type={model_config.model_type!r}"
+                )
+
+            self.is_vlm = (
+                not qwen35_text_only
+                and hasattr(model_config, "vision_config")
+                and getattr(model_config, "vision_config") is not None
+            )
             if self.is_vlm:
                 logger.info(
                     f"[VLM] Config {type(model_config).__name__} has a vision config, "
