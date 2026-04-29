@@ -390,8 +390,15 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
             sharded_sd[param_name] = sharded_tensor
     elif dist.get_rank() == 0:
-        for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
-            full_param = full_param.detach().cuda()
+        # Snapshot the keys/sharded params so we can `del full_sd[param_name]`
+        # after each broadcast — keeps rank 0 CPU RSS bounded for huge models
+        # (Qwen3.5-397B-A17B is ~803 GB BF16, otherwise rank 0 pins all of it
+        # on CPU until the loop finishes).
+        param_names = list(full_sd.keys())
+        sharded_params = list(meta_sharded_sd.values())
+        for param_name, sharded_param in zip(param_names, sharded_params):
+            full_param = full_sd[param_name].detach().cuda()
+            del full_sd[param_name]
             mesh = sharded_param.device_mesh
             dist.broadcast(full_param, src=0)
             sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
@@ -402,6 +409,7 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             )
             sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
             sharded_sd[param_name] = sharded_tensor
+            del full_param
     # We need this else to have a matching `broadcast` for all of the ranks, else we deadlock
     else:
         for param_name, sharded_param in meta_sharded_sd.items():
