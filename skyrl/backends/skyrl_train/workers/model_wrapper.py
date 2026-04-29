@@ -125,7 +125,8 @@ class HFModelWrapper(nn.Module):
             # (so weight keys match) but disable the VLM forward branch so
             # `forward(pixel_values=None)` flows through the standard text
             # path with computed 1D `position_ids`.
-            if self.is_vlm and getattr(model_config, "model_type", "") == "qwen3_5":
+            _qwen3_5_model_types = ("qwen3_5", "qwen3_5_moe")
+            if self.is_vlm and getattr(model_config, "model_type", "") in _qwen3_5_model_types:
                 logger.info(
                     "[qwen3_5 workaround] forcing is_vlm=False on text-only RL; "
                     "VLM checkpoint stays but forward uses 1D position_ids"
@@ -235,21 +236,23 @@ class HFModelWrapper(nn.Module):
             # `aten.{mul,mm}.default got mixed torch.Tensor and DTensor`.
             # Patch the relevant forwards to materialize DTensor params before
             # use.  Surgical to Qwen3.5 to avoid affecting other models.
-            if getattr(self.model.config, "model_type", "") == "qwen3_5":
+            if getattr(self.model.config, "model_type", "") in _qwen3_5_model_types:
                 try:
-                    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
                     from torch.distributed.tensor import DTensor
 
                     def _to_tensor(t):
                         return t.full_tensor() if isinstance(t, DTensor) else t
 
-                    def _patched_qwen3_5_rmsnorm_forward(self, x):
+                    def _patched_rmsnorm_forward(self, x):
                         output = self._norm(x.float())
                         weight = _to_tensor(self.weight)
                         output = output * (1.0 + weight.float())
                         return output.type_as(x)
 
-                    Qwen3_5RMSNorm.forward = _patched_qwen3_5_rmsnorm_forward
+                    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+                    Qwen3_5RMSNorm.forward = _patched_rmsnorm_forward
+                    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeRMSNorm
+                    Qwen3_5MoeRMSNorm.forward = _patched_rmsnorm_forward
 
                     # Also patch nn.Linear.forward globally to materialize
                     # DTensor weights/biases before F.linear.  This is broad
