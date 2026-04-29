@@ -225,35 +225,55 @@ class HFModelWrapper(nn.Module):
                     **from_pretrained_kwargs,
                 )
 
-            # WORKAROUND: Qwen3.5 RMSNorm `forward` returns
-            # `output * (1.0 + self.weight.float())`.  With FSDP2 + LoRA, frozen
-            # `self.weight` stays as a `DTensor` inside forward (it's not in
-            # the LoRA trainable set, so FSDP2 doesn't always all-gather it
-            # back to a plain Tensor before forward), and multiplying that with
-            # the regular `Tensor` activation crashes:
-            # `aten.mul.Tensor got mixed torch.Tensor and DTensor`.  Patch the
-            # forward to materialize the weight to a regular tensor when it's a
-            # DTensor.
+            # WORKAROUND: With FSDP2 + LoRA on Qwen3.5 (a VLM whose root is
+            # `Qwen3_5ForConditionalGeneration`), `apply_fsdp2` wraps each
+            # `Qwen3_5DecoderLayer` and the root model.  The DecoderLayer's
+            # pre-forward hook fails to all-gather the inner Linear layers'
+            # `weight` (frozen LoRA `base_layer.weight`) back to a plain
+            # Tensor — it remains a `DTensor` during forward.  Multiplying
+            # that with regular Tensor activations crashes with
+            # `aten.{mul,mm}.default got mixed torch.Tensor and DTensor`.
+            # Patch the relevant forwards to materialize DTensor params before
+            # use.  Surgical to Qwen3.5 to avoid affecting other models.
             if getattr(self.model.config, "model_type", "") == "qwen3_5":
                 try:
                     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
                     from torch.distributed.tensor import DTensor
 
+                    def _to_tensor(t):
+                        return t.full_tensor() if isinstance(t, DTensor) else t
+
                     def _patched_qwen3_5_rmsnorm_forward(self, x):
                         output = self._norm(x.float())
-                        weight = self.weight
-                        if isinstance(weight, DTensor):
-                            weight = weight.full_tensor()
+                        weight = _to_tensor(self.weight)
                         output = output * (1.0 + weight.float())
                         return output.type_as(x)
 
                     Qwen3_5RMSNorm.forward = _patched_qwen3_5_rmsnorm_forward
+
+                    # Also patch nn.Linear.forward globally to materialize
+                    # DTensor weights/biases before F.linear.  This is broad
+                    # but safe: full_tensor() is a no-op on regular Tensors.
+                    import torch.nn as _nn
+                    import torch.nn.functional as _F
+
+                    _orig_linear_forward = _nn.Linear.forward
+
+                    def _patched_linear_forward(self, x):
+                        weight = _to_tensor(self.weight)
+                        bias = _to_tensor(self.bias) if self.bias is not None else None
+                        if weight is self.weight and bias is self.bias:
+                            return _orig_linear_forward(self, x)
+                        return _F.linear(x, weight, bias)
+
+                    _nn.Linear.forward = _patched_linear_forward
+
                     logger.info(
-                        "[qwen3_5 workaround] patched Qwen3_5RMSNorm.forward to "
-                        "materialize DTensor weight before mul"
+                        "[qwen3_5 workaround] patched Qwen3_5RMSNorm.forward and "
+                        "nn.Linear.forward to materialize DTensor weight/bias before op"
                     )
                 except Exception as exc:  # pragma: no cover
-                    logger.warning(f"[qwen3_5 workaround] RMSNorm patch failed: {exc}")
+                    logger.warning(f"[qwen3_5 workaround] DTensor patch failed: {exc}")
 
             # gpt oss
             if Version(transformers.__version__) >= Version("4.56.2"):
