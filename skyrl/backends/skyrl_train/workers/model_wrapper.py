@@ -259,6 +259,46 @@ class HFModelWrapper(nn.Module):
                     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeRMSNorm
                     Qwen3_5MoeRMSNorm.forward = _patched_rmsnorm_forward
 
+                    # WORKAROUND: with `cpu_offload=true`, FSDP2 keeps frozen
+                    # parameters & buffers on CPU.  Qwen3.5's RotaryEmbedding
+                    # `inv_freq` is registered as a non-persistent buffer and
+                    # stays on CPU during forward, while `position_ids` is on
+                    # GPU.  The matmul crashes with
+                    # `Expected all tensors to be on the same device, but got
+                    # mat2 is on cuda:0, different from other tensors on cpu`.
+                    # Patch the rotary forward to move `inv_freq` to the
+                    # input's device on first call.
+                    import torch as _torch
+                    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+                        Qwen3_5TextRotaryEmbedding as _Q35Rope,
+                    )
+                    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+                        Qwen3_5MoeTextRotaryEmbedding as _Q35MoeRope,
+                    )
+
+                    def _patched_rope_forward(self, x, position_ids):
+                        # Ensure inv_freq is on the same device as position_ids
+                        # (cpu_offload may leave it on CPU).
+                        if self.inv_freq.device != position_ids.device:
+                            self.inv_freq = self.inv_freq.to(position_ids.device)
+                        if position_ids.ndim == 2:
+                            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+                        inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(
+                            3, position_ids.shape[1], -1, 1
+                        )
+                        position_ids_expanded = position_ids[:, :, None, :].float()
+                        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+                        with _torch.autocast(device_type=device_type, enabled=False):
+                            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
+                            freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
+                            emb = _torch.cat((freqs, freqs), dim=-1)
+                            cos = emb.cos() * self.attention_scaling
+                            sin = emb.sin() * self.attention_scaling
+                        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+                    _Q35Rope.forward = _patched_rope_forward
+                    _Q35MoeRope.forward = _patched_rope_forward
+
                     # Also patch nn.Linear.forward globally to materialize
                     # DTensor weights/biases before F.linear.  This is broad
                     # but safe: full_tensor() is a no-op on regular Tensors.
