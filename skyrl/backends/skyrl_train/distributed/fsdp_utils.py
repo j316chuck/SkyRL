@@ -396,8 +396,29 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
         # on CPU until the loop finishes).
         param_names = list(full_sd.keys())
         sharded_params = list(meta_sharded_sd.values())
-        for param_name, sharded_param in zip(param_names, sharded_params):
-            full_param = full_sd[param_name].detach().cuda()
+        # PERF: prefetch next param's CPU->GPU copy on a side stream while the
+        # current param is being broadcast.  Without this, every iter is a
+        # serial chain of (mmap read -> H2D copy -> NCCL broadcast -> shard).
+        # For Qwen3.5-397B (2641 keys, avg 304 MB) on weka-mounted HF cache,
+        # the H2D copy alone was ~8s/key (~5 hours total).  Pipelining brings
+        # this much closer to NCCL bandwidth-bound (~100 ms/key).
+        copy_stream = torch.cuda.Stream()
+
+        def _prefetch_to_gpu(name: str):
+            if name is None:
+                return None
+            cpu_t = full_sd[name].detach()
+            with torch.cuda.stream(copy_stream):
+                gpu_t = cpu_t.to(device="cuda", non_blocking=True)
+            return gpu_t
+
+        prefetched = _prefetch_to_gpu(param_names[0]) if param_names else None
+        for idx, (param_name, sharded_param) in enumerate(zip(param_names, sharded_params)):
+            full_param = prefetched
+            # Kick off prefetch for the NEXT param before we block on broadcast.
+            next_name = param_names[idx + 1] if idx + 1 < len(param_names) else None
+            prefetched = _prefetch_to_gpu(next_name)
+            torch.cuda.current_stream().wait_stream(copy_stream)
             del full_sd[param_name]
             mesh = sharded_param.device_mesh
             dist.broadcast(full_param, src=0)
