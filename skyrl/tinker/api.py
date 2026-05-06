@@ -214,7 +214,33 @@ async def create_checkpoint(
     checkpoint_id: str,
     checkpoint_type: types.CheckpointType,
 ):
-    """Create a pending CheckpointDB entry, relying on database constraints for validation."""
+    """Create or retry a pending CheckpointDB entry.
+
+    Idempotent on FAILED rows: a prior attempt that landed in FAILED is reset to
+    PENDING (clearing error_message/completed_at and refreshing created_at), so a
+    client retry of the same (model_id, checkpoint_id, checkpoint_type) succeeds
+    instead of being permanently blocked by the orphan PK from the failed attempt.
+    COMPLETED and PENDING rows still return 409 (do not clobber).
+    """
+    if not await session.get(ModelDB, model_id):
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+    existing = await session.get(
+        CheckpointDB, (model_id, checkpoint_id, checkpoint_type)
+    )
+    if existing is not None:
+        if existing.status == CheckpointStatus.FAILED:
+            existing.status = CheckpointStatus.PENDING
+            existing.error_message = None
+            existing.completed_at = None
+            existing.created_at = datetime.now(timezone.utc)
+            await session.flush()
+            return
+        raise HTTPException(
+            status_code=409,
+            detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'",
+        )
+
     checkpoint_db = CheckpointDB(
         model_id=model_id,
         checkpoint_id=checkpoint_id,
@@ -226,17 +252,23 @@ async def create_checkpoint(
     try:
         await session.flush()
     except IntegrityError:
+        # Concurrency race: another request inserted the same PK between our
+        # session.get and flush. Retry the FAILED-row reset path.
         await session.rollback()
-        # Determine which constraint failed by checking if the model exists
-        statement = select(ModelDB).where(ModelDB.model_id == model_id)
-        result = await session.exec(statement)
-
-        if not result.first():
-            raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-        else:
-            raise HTTPException(
-                status_code=409, detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'"
-            )
+        existing = await session.get(
+            CheckpointDB, (model_id, checkpoint_id, checkpoint_type)
+        )
+        if existing is not None and existing.status == CheckpointStatus.FAILED:
+            existing.status = CheckpointStatus.PENDING
+            existing.error_message = None
+            existing.completed_at = None
+            existing.created_at = datetime.now(timezone.utc)
+            await session.flush()
+            return
+        raise HTTPException(
+            status_code=409,
+            detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'",
+        )
 
 
 class LoRAConfig(BaseModel):
@@ -250,6 +282,7 @@ class CreateModelRequest(BaseModel):
     session_id: str
     base_model: str
     lora_config: LoRAConfig
+    model_role: str = "policy"
 
 
 class CreateModelResponse(BaseModel):
@@ -399,6 +432,8 @@ class Datum(BaseModel):
                 weights=weights,
                 advantages=inp["advantages"].to_types() if "advantages" in inp else types.TensorData(data=[]),
                 logprobs=inp["logprobs"].to_types() if "logprobs" in inp else types.TensorData(data=[]),
+                values=inp["values"].to_types() if "values" in inp else types.TensorData(data=[]),
+                returns=inp["returns"].to_types() if "returns" in inp else types.TensorData(data=[]),
             ),
             model_input=self.model_input.to_types(),
         )
@@ -408,12 +443,13 @@ class ForwardBackwardInput(BaseModel):
     _ALLOWED_KEYS_BY_LOSS_FN: ClassVar[dict[str, set[str]]] = {
         "cross_entropy": set(),
         "importance_sampling": set(),
-        "ppo": {"clip_low_threshold", "clip_high_threshold"},
+        "ppo": {"clip_low_threshold", "clip_high_threshold", "value_clip"},
         "cispo": {"clip_low_threshold", "clip_high_threshold"},
+        "ppo_critic": {"value_clip"},
     }
 
     data: list[Datum]
-    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo", "cispo"]
+    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo", "cispo", "ppo_critic"]
     loss_fn_config: dict[str, float] | None = None
 
     @model_validator(mode="after")
@@ -675,6 +711,16 @@ class WeightsInfoResponse(BaseModel):
     lora_rank: int | None = None
 
 
+class ClientConfigResponse(BaseModel):
+    pjwt_auth_enabled: bool = False
+
+
+@app.post("/api/v1/client/config", response_model=ClientConfigResponse)
+async def client_config():
+    """Stub for tinker SDK client_config handshake."""
+    return ClientConfigResponse()
+
+
 @app.get("/api/v1/healthz", response_model=HealthResponse)
 async def healthz():
     """Checks if the API server is ready."""
@@ -749,7 +795,7 @@ async def create_model(request: CreateModelRequest, session: AsyncSession = Depe
         session=session,
         request_type=types.RequestType.CREATE_MODEL,
         model_id=model_id,
-        request_data=types.CreateModelInput(lora_config=lora_config),
+        request_data=types.CreateModelInput(lora_config=lora_config, model_role=request.model_role),
     )
 
     model_db = ModelDB(
@@ -1053,8 +1099,10 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
 @app.get("/api/v1/get_server_capabilities", response_model=GetServerCapabilitiesResponse)
 async def get_server_capabilities(request: Request):
     """Retrieve information about supported models and server capabilities."""
+    engine_config = request.app.state.engine_config
     supported_models = [
-        SupportedModel(model_name=request.app.state.engine_config.base_model),
+        SupportedModel(model_name=engine_config.base_model),
+        *(SupportedModel(model_name=name) for name in engine_config.base_model_aliases),
     ]
     return GetServerCapabilitiesResponse(supported_models=supported_models)
 

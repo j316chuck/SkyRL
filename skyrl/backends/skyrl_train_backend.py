@@ -821,6 +821,35 @@ class SkyRLTrainBackend(AbstractBackend):
         with tarfile.open(output_path, "w") as tar:
             tar.add(source_dir, arcname=".")
 
+    def _log_tree(self, label: str, root: str, max_depth: int = 2) -> None:
+        """[ckpt-diag] log directory contents up to max_depth, with sizes."""
+        try:
+            root_abs = os.path.abspath(root)
+            if not os.path.isdir(root_abs):
+                logger.info("%s root=%s NOT_A_DIR", label, root_abs)
+                return
+            depth_root = root_abs.count(os.sep)
+            entries = []
+            for dirpath, dirnames, filenames in os.walk(root_abs):
+                depth = dirpath.count(os.sep) - depth_root
+                if depth > max_depth:
+                    dirnames[:] = []
+                    continue
+                for fn in filenames:
+                    fp = os.path.join(dirpath, fn)
+                    try:
+                        sz = os.path.getsize(fp)
+                    except OSError:
+                        sz = -1
+                    entries.append((fp, sz))
+            logger.info("%s root=%s entries=%d", label, root_abs, len(entries))
+            for fp, sz in entries[:50]:
+                logger.info("  %s %d", fp, sz)
+            if len(entries) > 50:
+                logger.info("  ... (%d more entries truncated)", len(entries) - 50)
+        except Exception as e:
+            logger.warning("%s failed: %s", label, e)
+
     def save_checkpoint(self, output_path, model_id: str) -> None:
         """Save full training checkpoint (model + optimizer + scheduler) as tar."""
         self._validate_model_state(model_id)
@@ -829,8 +858,39 @@ class SkyRLTrainBackend(AbstractBackend):
         with tempfile.TemporaryDirectory() as temp_dir:
             ckpt_dir = os.path.join(temp_dir, "checkpoint")
 
+            # [ckpt-diag] pre-dispatch state
+            md = self._model_metadata
+            lora_rank = (
+                md.lora_config.rank if (md is not None and md.lora_config is not None) else None
+            )
+            logger.info(
+                "[ckpt-diag] save_checkpoint pre-dispatch model_id=%s "
+                "output_path=%s temp_dir=%s ckpt_dir=%s ckpt_dir_exists=%s lora_rank=%s",
+                model_id,
+                output_path,
+                temp_dir,
+                ckpt_dir,
+                os.path.exists(ckpt_dir),
+                lora_rank,
+            )
+            self._log_tree("[ckpt-diag] pre-dispatch tree", temp_dir, max_depth=2)
+
             # Save checkpoint directory (includes optimizer state automatically)
             self._dispatch.save_checkpoint(model="policy", ckpt_dir=ckpt_dir, tokenizer=self._tokenizer)
+
+            # [ckpt-diag] post-dispatch state
+            logger.info(
+                "[ckpt-diag] save_checkpoint post-dispatch ckpt_dir=%s exists=%s isdir=%s",
+                ckpt_dir,
+                os.path.exists(ckpt_dir),
+                os.path.isdir(ckpt_dir),
+            )
+            self._log_tree("[ckpt-diag] post-dispatch tree", temp_dir, max_depth=2)
+            if not os.path.exists(ckpt_dir):
+                logger.error(
+                    "[ckpt-diag] ckpt_dir missing before tar — root cause of the ENOENT we see "
+                    "from /api/v1/save_weights"
+                )
 
             # Create tar archive
             self._create_tar_from_directory(ckpt_dir, output_path)

@@ -177,9 +177,7 @@ class MegatronStrategy(DistributedStrategy):
         self.set_seed(self.seed)
         self.world_size = dist.get_world_size()
 
-    def offload_to_cpu(
-        self, model, optimizer, pin_memory=True, non_blocking=True, offload_optimizer=True, offload_model=True
-    ):
+    def offload_to_cpu(self, model, optimizer, offload_optimizer=True, offload_model=True):
         """
         Offload model weights and optimizer to CPU memory.
         """
@@ -191,7 +189,7 @@ class MegatronStrategy(DistributedStrategy):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-    def backload_to_gpu(self, model, optimizer, non_blocking=True, backload_optimizer=True, backload_model=True):
+    def backload_to_gpu(self, model, optimizer, backload_optimizer=True, backload_model=True):
         """Reload model weights back to GPU."""
         if backload_model:
             load_megatron_model_to_gpu(model)
@@ -254,6 +252,18 @@ class MegatronStrategy(DistributedStrategy):
         scheduler: Optional[OptimizerParamScheduler] = None,
         tokenizer: Optional[PreTrainedTokenizer] = None,
     ):
+        # [ckpt-diag] entry
+        try:
+            global_rank = dist.get_rank()
+        except Exception:
+            global_rank = -1
+        self.print(
+            f"[ckpt-diag] save_checkpoint enter rank={global_rank} "
+            f"node_local_rank={node_local_rank} ckpt_dir={ckpt_dir} "
+            f"is_lora={self.is_lora} has_optim={optimizer is not None} "
+            f"has_sched={scheduler is not None} has_tok={tokenizer is not None}"
+        )
+
         # Extract base model.
         model: List[nn.Module] = model.actor_module
         assert len(model) == 1, "Megatron virtual pipeline parallel is not yet supported"
@@ -264,6 +274,10 @@ class MegatronStrategy(DistributedStrategy):
         # Create checkpoint directory if it doesn't exist.
         if node_local_rank == 0:
             io.makedirs(ckpt_dir, exist_ok=True)
+            self.print(
+                f"[ckpt-diag] node_local_rank=0 created ckpt_dir={ckpt_dir} "
+                f"isdir={os.path.isdir(ckpt_dir)}"
+            )
 
         # All ranks wait for the checkpoint directory to be created before saving.
         dist.barrier()
@@ -286,6 +300,11 @@ class MegatronStrategy(DistributedStrategy):
         # Save RNG state.
         sharded_state_dict["rng"] = self.get_rng_state()
 
+        self.print(
+            f"[ckpt-diag] sharded_state_dict.keys={sorted(sharded_state_dict.keys())} "
+            f"rank={global_rank}"
+        )
+
         # Save the checkpoint across ranks in parallel.
         save_strategy = get_default_save_sharded_strategy("torch_dist")
         save_strategy = FullyParallelSaveStrategyWrapper(
@@ -293,28 +312,58 @@ class MegatronStrategy(DistributedStrategy):
         )
 
         with io.local_work_dir(ckpt_dir) as work_dir:
-            # TODO(tgriggs): Support configurable async saves.
-            async_save_request = dist_checkpointing.save(
-                sharded_state_dict=sharded_state_dict,
-                checkpoint_dir=work_dir,
-                sharded_strategy=save_strategy,
-                async_sharded_save=False,
-                validate_access_integrity=True,
+            self.print(
+                f"[ckpt-diag] entered local_work_dir work_dir={work_dir} "
+                f"isdir={os.path.isdir(work_dir)} rank={global_rank}"
             )
+            try:
+                # TODO(tgriggs): Support configurable async saves.
+                async_save_request = dist_checkpointing.save(
+                    sharded_state_dict=sharded_state_dict,
+                    checkpoint_dir=work_dir,
+                    sharded_strategy=save_strategy,
+                    async_sharded_save=False,
+                    validate_access_integrity=True,
+                )
+                self.print(
+                    f"[ckpt-diag] dist_checkpointing.save returned rank={global_rank} "
+                    f"work_dir_isdir={os.path.isdir(work_dir)} "
+                    f"work_dir_entries={len(os.listdir(work_dir)) if os.path.isdir(work_dir) else -1}"
+                )
+            except Exception as e:
+                self.print(
+                    f"[ckpt-diag] dist_checkpointing.save RAISED rank={global_rank} "
+                    f"err={type(e).__name__}: {e}"
+                )
+                raise
             assert async_save_request is None, "Async save is not yet supported for Megatron"
 
             # Only global rank 0 saves the Huggingface config and tokenizer.
             if self.is_rank_0():
                 hf_dir = os.path.join(work_dir, "huggingface")
                 self.save_hf_configs(self.hf_config, hf_dir, tokenizer)
+                self.print(
+                    f"[ckpt-diag] rank0 saved hf_configs to {hf_dir} "
+                    f"isdir={os.path.isdir(hf_dir)}"
+                )
 
         if self.is_lora:
             self._save_lora_adapters(unwrapped_model, ckpt_dir)
+            self.print(
+                f"[ckpt-diag] _save_lora_adapters done rank={global_rank} "
+                f"ckpt_dir_entries={len(os.listdir(ckpt_dir)) if os.path.isdir(ckpt_dir) else -1}"
+            )
 
         dist.barrier()
         ckpt_base.async_calls.close()
         ckpt_base.async_calls = AsyncCallsQueue(persistent=True)
         self.print(f"Checkpoint successfully saved to {ckpt_dir}")
+        if global_rank == 0:
+            self.print(
+                f"[ckpt-diag] post-barrier rank0 final ckpt_dir={ckpt_dir} "
+                f"exists={os.path.exists(ckpt_dir)} "
+                f"entries={len(os.listdir(ckpt_dir)) if os.path.isdir(ckpt_dir) else -1}"
+            )
 
     def _get_rank_path(self, ckpt_dir):
         tp_rank = mpu.get_tensor_model_parallel_rank()
