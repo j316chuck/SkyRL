@@ -28,6 +28,11 @@ MEGATRON_CP=1
 NUM_INFERENCE_ENGINES=8
 INFERENCE_TP=1
 
+# Torch profiler config (set ENABLE_TORCH_PROFILER=true to enable)
+ENABLE_TORCH_PROFILER=false
+RANKS_TO_PROFILE="[0]"
+SAVE_PATH="$HOME/megatron_prof/tp${MEGATRON_TP}_pp${MEGATRON_PP}_cp${MEGATRON_CP}_nemotron_3_nano_4b"
+
 uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
@@ -39,6 +44,9 @@ uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
   generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \
   generator.inference_engine.tensor_parallel_size=$INFERENCE_TP \
+  trainer.policy.megatron_config.torch_profiler_config.enable=$ENABLE_TORCH_PROFILER \
+  trainer.policy.megatron_config.torch_profiler_config.ranks=$RANKS_TO_PROFILE \
+  trainer.policy.megatron_config.torch_profiler_config.save_path=$SAVE_PATH \
   trainer.policy.megatron_config.tensor_model_parallel_size=$MEGATRON_TP \
   trainer.policy.megatron_config.pipeline_model_parallel_size=$MEGATRON_PP \
   trainer.policy.megatron_config.context_parallel_size=$MEGATRON_CP \
