@@ -1,15 +1,155 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from cloudpathlib import AnyPath
-from sqlmodel import Session, SQLModel
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlmodel import Session, SQLModel, select
+from sqlmodel.ext.asyncio.session import AsyncSession
 
-from skyrl.tinker import types
+from skyrl.tinker import api, types
 from skyrl.tinker.config import EngineConfig
-from skyrl.tinker.db_models import ModelDB, SessionDB
+from skyrl.tinker.db_models import CheckpointDB, CheckpointStatus, ModelDB, SessionDB
 from skyrl.tinker.engine import TinkerEngine, prepare_model_pass_batch
 
 BASE_MODEL = "trl-internal-testing/tiny-Qwen3ForCausalLM"
+MODEL_ID = "model_for_checkpoint_tests"
+CHECKPOINT_ID = "global_step_0"
+
+
+async def _create_async_checkpoint_session(tmp_path) -> AsyncSession:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/test.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    return AsyncSession(engine)
+
+
+async def _insert_checkpoint_model(session: AsyncSession) -> None:
+    session.add(SessionDB(session_id="session_for_checkpoint_tests", tags=[], sdk_version="test"))
+    session.add(
+        ModelDB(
+            model_id=MODEL_ID,
+            base_model=BASE_MODEL,
+            lora_config={},
+            status="ready",
+            request_id=1,
+            session_id="session_for_checkpoint_tests",
+        )
+    )
+    await session.commit()
+
+
+async def _insert_checkpoint(session: AsyncSession, status: CheckpointStatus) -> None:
+    session.add(
+        CheckpointDB(
+            model_id=MODEL_ID,
+            checkpoint_id=CHECKPOINT_ID,
+            checkpoint_type=types.CheckpointType.TRAINING,
+            status=status,
+            completed_at=datetime.now(timezone.utc),
+            error_message="old failure",
+        )
+    )
+    await session.commit()
+
+
+async def _get_checkpoint(session: AsyncSession) -> CheckpointDB:
+    result = await session.exec(
+        select(CheckpointDB).where(
+            CheckpointDB.model_id == MODEL_ID,
+            CheckpointDB.checkpoint_id == CHECKPOINT_ID,
+            CheckpointDB.checkpoint_type == types.CheckpointType.TRAINING,
+        )
+    )
+    checkpoint = result.one()
+    return checkpoint
+
+
+def test_create_checkpoint_failed_row_returns_409_without_overwrite(tmp_path):
+    async def run_test():
+        async with await _create_async_checkpoint_session(tmp_path) as session:
+            await _insert_checkpoint_model(session)
+            await _insert_checkpoint(session, CheckpointStatus.FAILED)
+
+            with pytest.raises(HTTPException) as exc_info:
+                await api.create_checkpoint(
+                    session=session,
+                    model_id=MODEL_ID,
+                    checkpoint_id=CHECKPOINT_ID,
+                    checkpoint_type=types.CheckpointType.TRAINING,
+                )
+
+            assert exc_info.value.status_code == 409
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("status", [CheckpointStatus.FAILED, CheckpointStatus.COMPLETED])
+def test_create_checkpoint_overwrite_resets_terminal_row(tmp_path, status: CheckpointStatus):
+    async def run_test():
+        async with await _create_async_checkpoint_session(tmp_path) as session:
+            await _insert_checkpoint_model(session)
+            await _insert_checkpoint(session, status)
+
+            await api.create_checkpoint(
+                session=session,
+                model_id=MODEL_ID,
+                checkpoint_id=CHECKPOINT_ID,
+                checkpoint_type=types.CheckpointType.TRAINING,
+                overwrite=True,
+            )
+
+            checkpoint = await _get_checkpoint(session)
+            assert checkpoint.status == CheckpointStatus.PENDING
+            assert checkpoint.completed_at is None
+            assert checkpoint.error_message is None
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize(
+    ("status", "overwrite"),
+    [
+        (CheckpointStatus.PENDING, False),
+        (CheckpointStatus.PENDING, True),
+        (CheckpointStatus.COMPLETED, False),
+    ],
+)
+def test_create_checkpoint_existing_row_returns_409(tmp_path, status: CheckpointStatus, overwrite: bool):
+    async def run_test():
+        async with await _create_async_checkpoint_session(tmp_path) as session:
+            await _insert_checkpoint_model(session)
+            await _insert_checkpoint(session, status)
+
+            with pytest.raises(HTTPException) as exc_info:
+                await api.create_checkpoint(
+                    session=session,
+                    model_id=MODEL_ID,
+                    checkpoint_id=CHECKPOINT_ID,
+                    checkpoint_type=types.CheckpointType.TRAINING,
+                    overwrite=overwrite,
+                )
+
+            assert exc_info.value.status_code == 409
+
+    asyncio.run(run_test())
+
+
+def test_create_checkpoint_missing_model_returns_404(tmp_path):
+    async def run_test():
+        async with await _create_async_checkpoint_session(tmp_path) as session:
+            with pytest.raises(HTTPException) as exc_info:
+                await api.create_checkpoint(
+                    session=session,
+                    model_id=MODEL_ID,
+                    checkpoint_id=CHECKPOINT_ID,
+                    checkpoint_type=types.CheckpointType.TRAINING,
+                )
+
+            assert exc_info.value.status_code == 404
+
+    asyncio.run(run_test())
 
 
 def test_process_unload_model():

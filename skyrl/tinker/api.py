@@ -213,8 +213,39 @@ async def create_checkpoint(
     model_id: str,
     checkpoint_id: str,
     checkpoint_type: types.CheckpointType,
+    overwrite: bool = False,
 ):
-    """Create a pending CheckpointDB entry, relying on database constraints for validation."""
+    """Create a pending CheckpointDB entry, optionally replacing a terminal row."""
+    model_statement = select(ModelDB).where(ModelDB.model_id == model_id)
+    model_result = await session.exec(model_statement)
+    if not model_result.first():
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+    statement = select(CheckpointDB).where(
+        CheckpointDB.model_id == model_id,
+        CheckpointDB.checkpoint_id == checkpoint_id,
+        CheckpointDB.checkpoint_type == checkpoint_type,
+    )
+    result = await session.exec(statement)
+    checkpoint_db = result.first()
+
+    if checkpoint_db:
+        if not overwrite:
+            raise HTTPException(
+                status_code=409, detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'"
+            )
+        if checkpoint_db.status == CheckpointStatus.PENDING:
+            raise HTTPException(
+                status_code=409, detail=f"Checkpoint '{checkpoint_id}' is already being written for model '{model_id}'"
+            )
+
+        checkpoint_db.status = CheckpointStatus.PENDING
+        checkpoint_db.error_message = None
+        checkpoint_db.completed_at = None
+        checkpoint_db.created_at = datetime.now(timezone.utc)
+        await session.flush()
+        return
+
     checkpoint_db = CheckpointDB(
         model_id=model_id,
         checkpoint_id=checkpoint_id,
@@ -227,16 +258,9 @@ async def create_checkpoint(
         await session.flush()
     except IntegrityError:
         await session.rollback()
-        # Determine which constraint failed by checking if the model exists
-        statement = select(ModelDB).where(ModelDB.model_id == model_id)
-        result = await session.exec(statement)
-
-        if not result.first():
-            raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-        else:
-            raise HTTPException(
-                status_code=409, detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'"
-            )
+        raise HTTPException(
+            status_code=409, detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'"
+        )
 
 
 class LoRAConfig(BaseModel):
@@ -563,6 +587,7 @@ class SampleRequest(BaseModel):
 class SaveWeightsRequest(BaseModel):
     model_id: str
     path: str = Field(..., pattern=ID_PATTERN, max_length=ID_MAX_LENGTH)
+    overwrite: bool = False
     type: Literal["save_weights"] | None = None
 
 
@@ -927,6 +952,7 @@ async def save_weights(request: SaveWeightsRequest, session: AsyncSession = Depe
         model_id=request.model_id,
         checkpoint_id=request.path,
         checkpoint_type=types.CheckpointType.TRAINING,
+        overwrite=request.overwrite,
     )
 
     request_id = await create_future(

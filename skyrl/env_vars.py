@@ -64,6 +64,18 @@ Set to 0 to disable throttling (all tasks fire immediately).
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tinker Checkpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+SKYRL_TINKER_CHECKPOINT_STAGING_DIR = os.environ.get("SKYRL_TINKER_CHECKPOINT_STAGING_DIR")
+"""
+Optional shared filesystem directory used to stage Tinker training checkpoints.
+
+Set this when the API process and Ray workers do not share the same local
+``/tmp`` filesystem.
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Runtime Environment Exports
 # ─────────────────────────────────────────────────────────────────────────────
 
