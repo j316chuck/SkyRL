@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -26,7 +25,6 @@ DEFAULT_EVAL_INTERVAL = 5
 DEFAULT_MIN_ACCURACY = 0.9
 DEFAULT_MAX_JOB_SECONDS = 3600
 GSM8K_LR = 2e-2
-ANSWER_RE = re.compile(r"####\s*(-?[0-9,]+)")
 
 
 @dataclass(frozen=True)
@@ -133,25 +131,34 @@ def _completion(answer: str) -> str:
     return f" The answer is {answer}.\n#### {answer}\n"
 
 
-def _make_sft_datum(tokenizer, example: Gsm8kExample) -> tinker_types.Datum:
+def _make_weighted_sft_datum(
+    tokenizer, example: Gsm8kExample, answer: str | None = None
+) -> tuple[tinker_types.Datum, list[float]]:
+    answer = answer or example.answer
     prompt_tokens = tokenizer.encode(_prompt(example.question), add_special_tokens=True)
-    completion_tokens = tokenizer.encode(
-        _completion(example.answer), add_special_tokens=False
-    )
+    completion_tokens = tokenizer.encode(_completion(answer), add_special_tokens=False)
     all_tokens = prompt_tokens + completion_tokens
     target_tokens = all_tokens[1:] + [tokenizer.eos_token_id]
     weights = [0.0] * len(prompt_tokens) + [1.0] * len(completion_tokens)
-    return tinker_types.Datum(
+    shifted_weights = weights[1:] + [1.0]
+    datum = tinker_types.Datum(
         model_input=tinker_types.ModelInput.from_ints(all_tokens),
-        loss_fn_inputs={"target_tokens": target_tokens, "weights": weights[1:] + [1.0]},
+        loss_fn_inputs={"target_tokens": target_tokens, "weights": shifted_weights},
     )
+    return datum, shifted_weights
 
 
-def _extract_answer(text: str) -> str | None:
-    match = ANSWER_RE.search(text)
-    if match:
-        return match.group(1).replace(",", "")
-    return None
+def _make_sft_datum(tokenizer, example: Gsm8kExample) -> tinker_types.Datum:
+    return _make_weighted_sft_datum(tokenizer, example)[0]
+
+
+def _wrong_answer(answer: str) -> str:
+    return str(int(answer) + 1)
+
+
+def _weighted_nll(output, weights: list[float]) -> float:
+    logprobs = output.loss_fn_outputs[0]["logprobs"].data
+    return float(sum(-logprob * weight for logprob, weight in zip(logprobs, weights)))
 
 
 async def _unload_model(base_url: str, model_id: str) -> None:
@@ -175,25 +182,20 @@ async def _unload_model(base_url: str, model_id: str) -> None:
 def _evaluate_accuracy(
     training_client, tokenizer, examples: list[Gsm8kExample], job: Gsm8kJob
 ) -> float:
-    sampler = training_client.save_weights_and_get_sampling_client(
-        name=f"eval_{job.label}"
-    )
     correct = 0
     for example in examples:
-        sample = sampler.sample(
-            prompt=tinker_types.ModelInput.from_ints(
-                tokenizer.encode(_prompt(example.question), add_special_tokens=True)
-            ),
-            num_samples=1,
-            sampling_params=tinker_types.SamplingParams(
-                max_tokens=64,
-                temperature=0.0,
-                top_k=1,
-                seed=job.seed,
-            ),
-        ).result()
-        text = tokenizer.decode(sample.sequences[0].tokens, skip_special_tokens=True)
-        correct += int(_extract_answer(text) == example.answer)
+        good_datum, good_weights = _make_weighted_sft_datum(tokenizer, example)
+        bad_datum, bad_weights = _make_weighted_sft_datum(
+            tokenizer, example, answer=_wrong_answer(example.answer)
+        )
+        good_loss = _weighted_nll(
+            training_client.forward([good_datum], "cross_entropy").result(),
+            good_weights,
+        )
+        bad_loss = _weighted_nll(
+            training_client.forward([bad_datum], "cross_entropy").result(), bad_weights
+        )
+        correct += int(good_loss < bad_loss)
     return correct / len(examples)
 
 
