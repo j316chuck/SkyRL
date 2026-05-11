@@ -5,6 +5,12 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["skyrl*"]
 
+[tool.pytest.ini_options]
+markers = [
+    "integrations: tests that require external services, GPUs, or optional backend dependencies",
+    "slow: long-running tests that are not part of the default fast suite",
+]
+
 [project]
 name = "skyrl"
 dynamic = ["version"]
