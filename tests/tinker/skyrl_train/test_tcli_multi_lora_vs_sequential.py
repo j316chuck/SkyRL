@@ -197,10 +197,15 @@ def _run_pig_latin_job(
 
 def _run_serial(base_url: str, train_steps: int) -> TimingResult:
     started_at = time.perf_counter()
-    results = [
-        _run_pig_latin_job(base_url, job, train_steps=train_steps, unload=True)
-        for job in PIG_LATIN_JOBS
-    ]
+    results: list[AdapterRunResult] = []
+    try:
+        for job in PIG_LATIN_JOBS:
+            results.append(
+                _run_pig_latin_job(base_url, job, train_steps=train_steps, unload=False)
+            )
+    finally:
+        for result in results:
+            asyncio.run(_unload_model(base_url, result.model_id))
     return TimingResult(time.perf_counter() - started_at, results)
 
 

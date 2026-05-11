@@ -252,7 +252,13 @@ def _run_gsm8k_job(base_url: str, job: Gsm8kJob, *, unload: bool) -> Gsm8kJobRes
 
 def _run_serial(base_url: str) -> TimingResult:
     started_at = time.perf_counter()
-    results = [_run_gsm8k_job(base_url, job, unload=True) for job in GSM8K_JOBS]
+    results: list[Gsm8kJobResult] = []
+    try:
+        for job in GSM8K_JOBS:
+            results.append(_run_gsm8k_job(base_url, job, unload=False))
+    finally:
+        for result in results:
+            asyncio.run(_unload_model(base_url, result.model_id))
     return TimingResult(time.perf_counter() - started_at, results)
 
 
