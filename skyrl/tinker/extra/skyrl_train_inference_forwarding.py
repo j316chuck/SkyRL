@@ -142,7 +142,16 @@ class SkyRLTrainInferenceForwardingClient:
                 payload["stop"] = list(stop)
 
         url = f"{proxy_url}/v1/completions"
-        response = await self._http_client.post(url, json=payload)
+        # Sticky sampling: pass an X-Session-ID equal to model_name so a vLLM
+        # router (or LoRA-pinning load balancer) can route the request to the
+        # engine that already has this model_id's LoRA adapter loaded. Without
+        # this, concurrent multi-LoRA jobs round-robin across engines and pay
+        # repeated adapter-eviction + KV-cache-invalidation cost. Empirically
+        # this halves p99 step latency at 4-way concurrent multi-LoRA on a
+        # single multilora endpoint.
+        response = await self._http_client.post(
+            url, json=payload, headers={"X-Session-ID": model_name}
+        )
         if response.status_code >= 400:
             raise RuntimeError(f"vLLM /v1/completions returned {response.status_code}: {response.text}")
         try:

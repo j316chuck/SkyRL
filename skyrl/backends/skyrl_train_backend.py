@@ -1015,6 +1015,10 @@ class SkyRLTrainBackend(AbstractBackend):
                         "prompt": model_input.model_dump(),
                         "num_samples": 1,
                         "sampling_params": sampling_params.model_dump(),
+                        # Sticky sampling: tag the request with its model_id so the
+                        # forwarder/router can pin it to the vLLM engine that already
+                        # has this LoRA loaded. No-op for single-tenant / FFT.
+                        "session_id": prepared_batch.all_model_ids[i],
                     }
                 }
                 tasks.append(self._inference_engine_client.sample(request_payload))
