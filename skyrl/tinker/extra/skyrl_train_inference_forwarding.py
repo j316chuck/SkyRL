@@ -5,6 +5,7 @@ Pair to :class:`ExternalInferenceClient`; resolves the target URL from
 """
 
 import asyncio
+import os
 from datetime import datetime, timezone
 
 import httpx
@@ -31,7 +32,7 @@ class SkyRLTrainInferenceForwardingClient:
         max_conn = engine_config.forwarding_inference_max_connections
         max_keepalive = max(max_conn // 4, 32) if max_conn is not None else None
         self._http_client: httpx.AsyncClient = httpx.AsyncClient(
-            timeout=httpx.Timeout(300.0, connect=10.0),
+            timeout=httpx.Timeout(float(__import__("os").environ.get("SKYRL_FORWARDING_INFERENCE_TIMEOUT_SEC", "1800")), connect=10.0),
             limits=httpx.Limits(
                 max_connections=max_conn,
                 max_keepalive_connections=max_keepalive,
@@ -93,20 +94,45 @@ class SkyRLTrainInferenceForwardingClient:
             await session.commit()
 
     async def _forward_with_retry(self, sample_req, model_id: str, *, base_model: str | None) -> types.SampleOutput:
-        # httpx.RequestError covers ConnectError, ReadError, TimeoutException, etc.
-        # HTTP 4xx/5xx surfaces as RuntimeError below and is NOT retried.
-        try:
-            proxy_url = await self._resolve_proxy_url()
-            return await self._forward(proxy_url, sample_req, model_id, base_model=base_model)
-        except httpx.RequestError as e:
-            logger.warning(
-                "Network error talking to %s (%s: %s) — refreshing proxy URL and retrying once",
-                self._cached_proxy_url,
-                type(e).__name__,
-                e,
-            )
-            proxy_url = await self._resolve_proxy_url(force_refresh=True)
-            return await self._forward(proxy_url, sample_req, model_id, base_model=base_model)
+        max_retries = int(os.environ.get("SKYRL_FORWARDING_TRANSIENT_HTTP_MAX_RETRIES", "120"))
+        initial_backoff = float(
+            os.environ.get("SKYRL_FORWARDING_TRANSIENT_HTTP_INITIAL_BACKOFF_SEC", "1")
+        )
+        max_backoff = float(os.environ.get("SKYRL_FORWARDING_TRANSIENT_HTTP_MAX_BACKOFF_SEC", "30"))
+        attempt = 0
+        while True:
+            caught_error = None
+            try:
+                proxy_url = await self._resolve_proxy_url(force_refresh=attempt > 0)
+                return await self._forward(proxy_url, sample_req, model_id, base_model=base_model)
+            except httpx.RequestError as e:
+                caught_error = e
+                retryable = True
+                error = f"{type(e).__name__}: {e}"
+            except RuntimeError as e:
+                caught_error = e
+                error = str(e)
+                retryable = (
+                    "vLLM /v1/completions returned 503" in error
+                    or "No available workers" in error
+                    or "all circuits open" in error
+                    or "inference engine not ready" in error
+                    or "no proxy URL published" in error
+                )
+            if not retryable or attempt >= max_retries:
+                raise caught_error
+            delay = min(max_backoff, initial_backoff * (2 ** min(attempt, 8)))
+            if attempt == 0 or (attempt + 1) % 10 == 0:
+                logger.warning(
+                    "Transient vLLM forwarding error; keeping future pending "
+                    "(attempt=%s/%s delay=%.1fs error=%s)",
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                    error,
+                )
+            await asyncio.sleep(delay)
+            attempt += 1
 
     async def _forward(
         self, proxy_url: str, sample_req, model_id: str, *, base_model: str | None
@@ -149,6 +175,14 @@ class SkyRLTrainInferenceForwardingClient:
 
         url = f"{proxy_url}/v1/completions"
         response = await self._http_client.post(url, json=payload, headers=headers)
+        if response.status_code == 404 and "does not exist" in response.text:
+            # merged-LoRA mode: no adapter registered under model_id; the merged
+            # weights are served under the base model name.
+            models_resp = await self._http_client.get(f"{proxy_url}/v1/models")
+            served = models_resp.json().get("data", [])
+            if served:
+                payload["model"] = served[0]["id"]
+                response = await self._http_client.post(url, json=payload, headers=headers)
         if response.status_code >= 400:
             raise RuntimeError(f"vLLM /v1/completions returned {response.status_code}: {response.text}")
         try:

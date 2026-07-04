@@ -1218,6 +1218,15 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             training_dtype=torch.bfloat16 if self.cfg.bf16 else torch.float32,
         )
 
+    def _remap_megatron_lora_state_for_vllm(self, adapter_state: dict) -> dict:
+        out = {}
+        for key, tensor in adapter_state.items():
+            if ".visual." in key or ".mtp." in key or ".multi_token" in key:
+                continue
+            new_key = key.replace("base_model.model.model.language_model.", "base_model.model.model.")
+            out[new_key] = tensor
+        return out
+
     async def _save_lora_adapters_and_sync(
         self, lora_sync_path, inference_engine_client, lora_name: str = SKYRL_LORA_ADAPTER_NAME
     ):
@@ -1238,6 +1247,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         adapter_state = {}
         for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False):
             adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+        adapter_state = self._remap_megatron_lora_state_for_vllm(adapter_state)
 
         if torch.distributed.get_rank() == 0:
             os.makedirs(lora_sync_path, exist_ok=True)

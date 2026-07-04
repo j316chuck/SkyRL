@@ -1393,6 +1393,268 @@ async def root():
     }
 
 
+# In-memory futures for SkyRL tinker api EXTERNAL request type.
+#
+# Why this runtime patch exists: under multi-tenant qwen3p6 endpoint load, the
+# SQLite-backed future path failed before sampling finished. Observed examples:
+# XID 1023109 request_id=14194 hit SQLAlchemy QueuePool exhaustion,
+# XID 1023138 request_id=12 returned 404 Future not found, and XID 1023220
+# request_id=14614 returned an empty 400. After this patch, 10x GSM8K 2-step
+# stress XIDs 1034273 and 1034275-1034283 completed on endpoints 47/50/51.
+#
+# TODO(upstream): replace this append-time patch with a first-class SkyRL
+# EXTERNAL future backend: in-process asyncio events for single-worker serving,
+# or Redis/Postgres/queue-backed futures for cross-process durability.
+#
+# Append target: SkyRL/skyrl/tinker/api.py (after all routes are registered).
+# Eliminates the SQLite write+poll hot path that saturates the aiosqlite worker
+# threads and the asyncio loop under multi-tenant load.
+import asyncio as _asy
+import itertools as _it
+import os as _os
+from datetime import datetime as _dt
+from datetime import timezone as _tz
+
+from fastapi import HTTPException as _HE
+
+_RETRIEVE_TIMEOUT = float(_os.environ.get("SKYRL_FORWARDING_INFERENCE_TIMEOUT_SEC", "1800"))
+_NEXT_ID = _it.count(start=2**31)
+_FUTURES: dict = {}
+_EVENTS: dict = {}
+_DB_FLUSH_QUEUE = None
+_DB_FLUSH_WORKERS: list = []
+_DB_FLUSH_WORKER_COUNT = int(_os.environ.get("SKYRL_INMEM_DB_FLUSH_WORKERS", "2"))
+
+
+def _model_dump(value):
+  if hasattr(value, "model_dump"):
+    return value.model_dump()
+  return value
+
+
+def _ensure_event(rid):
+  ev = _EVENTS.get(rid)
+  if ev is None:
+    ev = _asy.Event()
+    _EVENTS[rid] = ev
+  return ev
+
+
+# Retain retrieved terminal futures briefly so duplicate retrieves from pickled
+# rollout workers (shared request-id space) stay idempotent instead of 404ing.
+# Short window: cross-session reuse is prevented by one-client-per-pod discipline.
+_RETRIEVED_RETENTION_SEC = float(_os.environ.get("SKYRL_INMEM_RETRIEVED_RETENTION_SEC", "45"))
+_PENDING_POPS: set = set()
+
+
+def _delayed_pop(rid):
+  if rid in _PENDING_POPS:
+    return
+  _PENDING_POPS.add(rid)
+
+  async def _pop_later():
+    await _asy.sleep(_RETRIEVED_RETENTION_SEC)
+    _FUTURES.pop(rid, None)
+    _EVENTS.pop(rid, None)
+    _PENDING_POPS.discard(rid)
+
+  _asy.create_task(_pop_later())
+
+
+_orig_create_future = create_future  # noqa: F821
+
+
+async def create_future(session, request_type, model_id, request_data):  # noqa: F811
+  if request_type == types.RequestType.EXTERNAL:  # noqa: F821
+    rid = next(_NEXT_ID)
+    _FUTURES[rid] = {
+      "status": RequestStatus.PENDING,  # noqa: F821
+      "request_type": request_type,
+      "model_id": model_id,
+      "request_data": request_data,
+      "result_data": None,
+      "created_at": _dt.now(_tz.utc),
+      "completed_at": None,
+    }
+    _ensure_event(rid)
+    return rid
+  return await _orig_create_future(session, request_type, model_id, request_data)
+
+
+app.router.routes[:] = [r for r in app.router.routes if getattr(r, "path", "") != "/api/v1/retrieve_future"]  # noqa: F821
+
+
+@app.post("/api/v1/retrieve_future")  # noqa: F821
+async def retrieve_future(request: RetrieveFutureRequest, req: Request):  # noqa: F811,F821
+  rid = int(request.request_id)
+  fut = _FUTURES.get(rid)
+  if fut is not None:
+    if fut["status"] == RequestStatus.PENDING:  # noqa: F821
+      try:
+        await _asy.wait_for(_ensure_event(rid).wait(), timeout=_RETRIEVE_TIMEOUT)
+      except _asy.TimeoutError:
+        pass
+    fut = _FUTURES.get(rid)
+    if fut is None or fut["status"] == RequestStatus.PENDING:  # noqa: F821
+      raise _HE(status_code=408, detail="Timeout waiting for result")
+    if fut["status"] == RequestStatus.FAILED:  # noqa: F821
+      result_data = fut["result_data"] or {}
+      _delayed_pop(rid)
+      if "error" in result_data:
+        raise _HE(status_code=400, detail=result_data["error"])
+      raise _HE(status_code=500, detail="Unknown error")
+    result_data = fut["result_data"]
+    _delayed_pop(rid)
+    return result_data
+
+  deadline = time.perf_counter() + _RETRIEVE_TIMEOUT  # noqa: F821
+  poll = 0.1
+  while time.perf_counter() < deadline:  # noqa: F821
+    try:
+      async with AsyncSession(req.app.state.db_engine) as session:  # noqa: F821
+        statement = select(FutureDB.status).where(FutureDB.request_id == rid)  # noqa: F821
+        result = await session.exec(statement)
+        status = result.first()
+        if not status:
+          raise _HE(status_code=404, detail="Future not found")
+        if status in (RequestStatus.COMPLETED, RequestStatus.FAILED):  # noqa: F821
+          statement = select(FutureDB).where(FutureDB.request_id == rid)  # noqa: F821
+          result = await session.exec(statement)
+          f2 = result.first()
+          if f2.status == RequestStatus.COMPLETED:  # noqa: F821
+            return f2.result_data
+          if f2.status == RequestStatus.FAILED:  # noqa: F821
+            result_data = f2.result_data
+            if result_data and "error" in result_data:
+              raise _HE(status_code=400, detail=result_data["error"])
+            raise _HE(status_code=500, detail="Unknown error")
+    except _HE:
+      raise
+    except Exception:
+      pass
+    await _asy.sleep(poll)
+    poll = min(poll * 1.5, 1.0)
+  raise _HE(status_code=408, detail="Timeout waiting for result")
+
+
+from skyrl.tinker.extra import skyrl_train_inference_forwarding as _forw  # noqa: E402
+
+_orig_cas = _forw.SkyRLTrainInferenceForwardingClient.call_and_store_result
+_FANOUT_SEMA = getattr(_forw, "_FANOUT_SEMA", _asy.Semaphore(256))
+_TRANSIENT_HTTP_MAX_RETRIES = int(
+  _os.environ.get("SKYRL_FORWARDING_TRANSIENT_HTTP_MAX_RETRIES", "120")
+)
+_TRANSIENT_HTTP_INITIAL_BACKOFF_SEC = float(
+  _os.environ.get("SKYRL_FORWARDING_TRANSIENT_HTTP_INITIAL_BACKOFF_SEC", "1")
+)
+_TRANSIENT_HTTP_MAX_BACKOFF_SEC = float(
+  _os.environ.get("SKYRL_FORWARDING_TRANSIENT_HTTP_MAX_BACKOFF_SEC", "30")
+)
+
+
+def _is_transient_forwarding_error(exc):
+  text = str(exc)
+  return (
+    "vLLM /v1/completions returned 503" in text
+    or "No available workers" in text
+    or "all circuits open" in text
+  )
+
+
+async def _forward_with_transient_http_retry(self, sample_req, model_id, base_model=None):
+  attempt = 0
+  while True:
+    try:
+      return await self._forward_with_retry(sample_req, model_id, base_model=base_model)
+    except Exception as exc:
+      if not _is_transient_forwarding_error(exc) or attempt >= _TRANSIENT_HTTP_MAX_RETRIES:
+        raise
+      delay = min(
+        _TRANSIENT_HTTP_MAX_BACKOFF_SEC,
+        _TRANSIENT_HTTP_INITIAL_BACKOFF_SEC * (2 ** min(attempt, 8)),
+      )
+      if attempt == 0 or (attempt + 1) % 10 == 0:
+        print(
+          "[patch] transient forwarding error; keeping future pending "
+          f"attempt={attempt + 1}/{_TRANSIENT_HTTP_MAX_RETRIES} delay={delay:.1f}s error={exc}"
+        )
+      await _asy.sleep(delay)
+      attempt += 1
+
+
+async def _persist_terminal_future(db_engine, request_id, fut):
+  try:
+    async with AsyncSession(db_engine) as session:  # noqa: F821
+      row = await session.get(FutureDB, request_id)  # noqa: F821
+      if row is None:
+        row = FutureDB(  # noqa: F821
+          request_id=request_id,
+          request_type=fut["request_type"],
+          model_id=fut["model_id"],
+          request_data=_model_dump(fut["request_data"]),
+          result_data=fut["result_data"],
+          status=fut["status"],
+          created_at=fut["created_at"],
+          completed_at=fut["completed_at"],
+        )
+        session.add(row)
+      else:
+        row.result_data = fut["result_data"]
+        row.status = fut["status"]
+        row.completed_at = fut["completed_at"]
+      await session.commit()
+  except Exception as exc:
+    print(f"[patch] inmem_futures DB flush failed request_id={request_id}: {exc}")
+
+
+async def _db_flush_worker():
+  while True:
+    db_engine, request_id, fut = await _DB_FLUSH_QUEUE.get()
+    try:
+      await _persist_terminal_future(db_engine, request_id, fut)
+    finally:
+      _DB_FLUSH_QUEUE.task_done()
+
+
+def _enqueue_terminal_future(db_engine, request_id, fut):
+  global _DB_FLUSH_QUEUE
+  if _DB_FLUSH_QUEUE is None:
+    _DB_FLUSH_QUEUE = _asy.Queue()
+    for _ in range(_DB_FLUSH_WORKER_COUNT):
+      _DB_FLUSH_WORKERS.append(_asy.create_task(_db_flush_worker()))
+  _DB_FLUSH_QUEUE.put_nowait((db_engine, request_id, fut))
+
+
+async def _cas_inmem(self, request_id, sample_req, model_id, checkpoint_id, base_model=None):
+  if request_id in _FUTURES:
+    try:
+      async with _FANOUT_SEMA:
+        result = await _forward_with_transient_http_retry(
+          self, sample_req, model_id, base_model=base_model
+        )
+      result_data = result.model_dump()
+      status = RequestStatus.COMPLETED  # noqa: F821
+    except Exception as exc:
+      result_data = {"error": str(exc), "status": "failed"}
+      status = RequestStatus.FAILED  # noqa: F821
+    _FUTURES[request_id]["result_data"] = result_data
+    _FUTURES[request_id]["status"] = status
+    _FUTURES[request_id]["completed_at"] = _dt.now(_tz.utc)
+    _enqueue_terminal_future(self.db_engine, request_id, dict(_FUTURES[request_id]))
+    _ensure_event(request_id).set()
+    return
+  return await _orig_cas(
+    self, request_id, sample_req, model_id, checkpoint_id, base_model=base_model
+  )
+
+
+_forw.SkyRLTrainInferenceForwardingClient.call_and_store_result = _cas_inmem
+
+print(
+  "[patch] inmem_futures: EXTERNAL request_type bypasses SQLite (dict + asyncio.Event signaling)"
+)
+
+
 if __name__ == "__main__":
     import argparse
 
