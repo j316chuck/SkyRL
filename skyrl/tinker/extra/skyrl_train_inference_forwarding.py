@@ -133,6 +133,15 @@ class SkyRLTrainInferenceForwardingClient:
             "stream": False,
             "return_token_ids": True,
         }
+        stop = getattr(sp, "stop", None)
+        if stop:
+            # SamplingParams.stop carries token ids (ints) from agent frameworks
+            # or strings from raw callers; vLLM accepts both forms. Dropping them
+            # makes completions run past the caller's turn boundaries.
+            if all(isinstance(t, int) for t in stop):
+                payload["stop_token_ids"] = list(stop)
+            else:
+                payload["stop"] = list(stop)
         # SamplingParams.stop is polymorphic (list[str] | list[int]).
         stop = getattr(sp, "stop", None)
         if stop:
