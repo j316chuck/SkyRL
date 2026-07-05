@@ -1236,6 +1236,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         adapter_state = {}
         for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False):
+            # vLLM *ForConditionalGeneration models nest the LM under `language_model.`;
+            # megatron-bridge emits `model.language_model.*`. Swap the segment order so
+            # vLLM's PEFT loader matches modules instead of silently ignoring every
+            # tensor (which freezes the sampler at the base model).
+            if name.startswith("model.language_model."):
+                name = "language_model.model." + name[len("model.language_model.") :]
             adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
 
         if torch.distributed.get_rank() == 0:
