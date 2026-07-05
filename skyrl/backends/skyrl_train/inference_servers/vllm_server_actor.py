@@ -365,19 +365,26 @@ class VLLMServerActor(ServerActorProtocol):
 
             models = request.app.state.openai_serving_models
             async with models.lora_resolver_lock[lora_name]:
-                lora_int_id = (
+                old_id = (
                     models.lora_requests[lora_name].lora_int_id
                     if lora_name in models.lora_requests
-                    else models.lora_id_counter.inc(1)
+                    else None
                 )
+                # In-place reload under a fixed id is a no-op in current vLLM
+                # (vllm-project/vllm#41482), which freezes the sampler at the
+                # first adapter. Rotate the id so new weights actually load, and
+                # bound ids to {1, 2}: unbounded id growth leaks one adapter of
+                # GPU memory per reload (remove_lora does not reclaim it) and
+                # OOMs long training runs.
+                lora_int_id = 2 if old_id == 1 else 1
+                if old_id is not None:
+                    await models.engine_client.remove_lora(old_id)
                 lora_request = LoRARequest(
                     lora_name=lora_name,
                     lora_int_id=lora_int_id,
                     lora_path=lora_path,
-                    load_inplace=True,
                 )
                 await models.engine_client.add_lora(lora_request)
-                lora_request.load_inplace = False
                 models.lora_requests[lora_name] = lora_request
 
             return {
