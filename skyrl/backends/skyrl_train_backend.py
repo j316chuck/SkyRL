@@ -786,6 +786,15 @@ class SkyRLTrainBackend(AbstractBackend):
         if pad_size > 0 and per_sample_outputs:
             per_sample_outputs = per_sample_outputs[:-pad_size]
 
+        # TODO(#fwdbwd-order): when token-based microbatching is enabled the worker
+        # emits per_sample_outputs in *packed* (bin-packed, length-descending) order,
+        # not submission order, so the request_batch_slices indexing below pairs each
+        # request's outputs with the wrong sequences. The forward path already fixes
+        # this via TokenBasedBatchIterator + _reorder_megatron_forward_output; the
+        # forward_backward path must invert the same permutation here before slicing.
+        # Draft fix / analysis: https://github.com/j316chuck/SkyRL/pull/14
+        # (Latent when callers submit 1 sequence/microbatch, e.g. long RL trajectories.)
+
         metrics = self._extract_metrics(data.metrics)
 
         results = {}
