@@ -14,7 +14,7 @@ from tinker import types
 from transformers import AutoTokenizer
 
 from skyrl.tinker.api import _build_uv_run_cmd_engine
-from skyrl.tinker.config import EngineConfig
+from skyrl.tinker.config import EngineConfig, config_to_argv
 from tests.tinker.conftest import api_server_is_up, wait_for_condition
 
 BASE_MODEL = "trl-internal-testing/tiny-Qwen3ForCausalLM"
@@ -28,6 +28,12 @@ FAST_CLEANUP_INTERVAL_SEC = 1  # How often to check for stale sessions
 FAST_CLEANUP_TIMEOUT_SEC = 3  # Seconds without heartbeat before session is stale
 
 TINKER_API_KEY = "tml-dummy"
+
+
+def test_prewarm_inference_is_forwarded_to_api_cli():
+    config = EngineConfig(base_model=BASE_MODEL, prewarm_inference=True)
+
+    assert "--prewarm-inference" in config_to_argv(config)
 
 
 def verify_training_client(training_client: tinker.TrainingClient):

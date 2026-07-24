@@ -57,6 +57,8 @@ API_SERVER_STARTUP_ARGS = ["-m", "skyrl.tinker.api"]
 
 # Timeout for graceful shutdown when engine crashes
 SHUTDOWN_TIMEOUT_SECONDS = 10
+PREWARM_SESSION_ID = "prewarm-inference"
+PREWARM_MODEL_ID = "prewarm-inference"
 
 
 def _get_parent_uv_run_args(parent_cmd: list[str]) -> list[str]:
@@ -103,6 +105,51 @@ def _build_uv_run_cmd_engine(parent_cmd: list[str], engine_config: BaseModel) ->
     cmd.extend(["-m", "skyrl.tinker.engine"])
     cmd.extend(config_to_argv(engine_config))
     return cmd
+
+
+async def _prewarm_inference(app: FastAPI) -> None:
+    """Create a retained LoRA so non-colocated inference publishes its proxy at startup."""
+    config = app.state.engine_config
+    if not config.prewarm_inference:
+        return
+    lora_config = types.LoraConfig(rank=32, alpha=32.0, seed=0)
+    async with AsyncSession(app.state.db_engine) as session:
+        session.add(
+            SessionDB(
+                session_id=PREWARM_SESSION_ID,
+                tags=["prewarm-inference"],
+                user_metadata={},
+                sdk_version="skyrl-prewarm",
+            )
+        )
+        request_id = await create_future(
+            session,
+            types.RequestType.CREATE_MODEL,
+            PREWARM_MODEL_ID,
+            types.CreateModelInput(lora_config=lora_config),
+        )
+        session.add(
+            ModelDB(
+                model_id=PREWARM_MODEL_ID,
+                base_model=config.base_model,
+                lora_config=lora_config.model_dump(),
+                status="created",
+                request_id=request_id,
+                session_id=PREWARM_SESSION_ID,
+            )
+        )
+        await session.commit()
+
+    while True:
+        async with AsyncSession(app.state.db_engine) as session:
+            future = await session.get(FutureDB, request_id)
+        assert future is not None
+        if future.status == RequestStatus.COMPLETED:
+            logger.info("Prewarmed inference model=%s", PREWARM_MODEL_ID)
+            return
+        if future.status == RequestStatus.FAILED:
+            raise RuntimeError(f"Inference prewarm failed: {future.result_data}")
+        await asyncio.sleep(1)
 
 
 @asynccontextmanager
@@ -159,6 +206,8 @@ async def lifespan(app: FastAPI):
     background_engine = await asyncio.create_subprocess_exec(*cmd)
     app.state.background_engine = background_engine
     logger.info(f"Started background engine with PID {background_engine.pid}: {' '.join(cmd)}")
+
+    await _prewarm_inference(app)
 
     shutting_down = False
 

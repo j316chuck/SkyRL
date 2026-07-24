@@ -58,6 +58,10 @@ class EngineConfig(BaseModel):
         ),
         json_schema_extra={"argparse_type": lambda v: None if v == "None" else int(v)},
     )
+    prewarm_inference: bool = Field(
+        default=False,
+        description="Create and retain one LoRA model before the API accepts requests.",
+    )
     session_cleanup_interval_sec: int = Field(
         default=60,
         description="How often to check for stale sessions (seconds). Set to -1 to disable cleanup.",
