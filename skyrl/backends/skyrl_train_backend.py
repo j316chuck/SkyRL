@@ -433,6 +433,10 @@ class SkyRLTrainBackend(AbstractBackend):
             self._render_server.shutdown()
             self._render_server = None
 
+    def ensure_inference_engines(self):
+        """Create inference engines before serving an opt-in startup prewarm."""
+        self._ensure_inference_engines()
+
     def _lora_signature_from(self, lora_config: types.LoraConfig) -> tuple:
         # Tinker's public LoraConfig only exposes rank + alpha (plus
         # seed/train_attn/train_mlp/train_unembed) - pending support https://github.com/NovaSky-AI/SkyRL/issues/1632.

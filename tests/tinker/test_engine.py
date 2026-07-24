@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from cloudpathlib import AnyPath
@@ -14,6 +15,24 @@ from skyrl.tinker.engine import (
 )
 
 BASE_MODEL = "trl-internal-testing/tiny-Qwen3ForCausalLM"
+
+
+def test_prewarm_create_model_starts_skyrl_train_inference():
+    """Prewarm starts the proxy before the create-model future completes."""
+    calls = []
+    engine = TinkerEngine.__new__(TinkerEngine)
+    engine.config = SimpleNamespace(prewarm_inference=True, backend="megatron")
+    engine.backend = SimpleNamespace(
+        create_model=lambda *args, **kwargs: calls.append("create_model"),
+        ensure_inference_engines=lambda: calls.append("ensure_inference_engines"),
+    )
+
+    engine.process_create_model(
+        "prewarm",
+        types.CreateModelInput(lora_config=types.LoraConfig(rank=32, alpha=32)),
+    )
+
+    assert calls == ["create_model", "ensure_inference_engines"]
 
 
 def test_process_unload_model():

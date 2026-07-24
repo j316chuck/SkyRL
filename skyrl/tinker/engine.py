@@ -479,6 +479,8 @@ class TinkerEngine:
         """Create and initialize a model."""
         # Create model in backend (allocates adapter_index, creates optimizer, and configures adapter)
         self.backend.create_model(model_id, request_data.lora_config, model_role=request_data.model_role)
+        if self.config.prewarm_inference and self.config.backend in ("fsdp", "megatron"):
+            self.backend.ensure_inference_engines()
 
         logger.info(f"Created LoRA model {model_id}")
 
