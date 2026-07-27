@@ -47,10 +47,12 @@ MEGATRON_TP=4
 MEGATRON_PP=1
 MEGATRON_CP=1
 
-TIS_IMP_RATIO_CAP=2.0
-TIS_TYPE=token
+SEQUENCE_MASK_METRIC=geometric
+GEO_MASK_HIGH=1.01
+GEO_MASK_LOW=0.99
 
-OPTIMIZER_OFFLOAD=true
+MAX_TOKENS_PER_MICROBATCH="${MAX_TOKENS_PER_MICROBATCH:-40960}"
+OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-false}"
 OPTIMIZER_OFFLOAD_FRACTION=1.0
 
 LANGUAGE_MODEL_ONLY=true
@@ -97,8 +99,9 @@ uv run --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   trainer.policy.megatron_config.optimizer_config_kwargs.use_precision_aware_optimizer=$OPTIMIZER_OFFLOAD \
   trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_cpu_offload=$OPTIMIZER_OFFLOAD \
   trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_offload_fraction=$OPTIMIZER_OFFLOAD_FRACTION \
-  trainer.algorithm.off_policy_correction.tis_ratio_type=$TIS_TYPE \
-  trainer.algorithm.off_policy_correction.token_tis_ratio_clip_high=$TIS_IMP_RATIO_CAP \
+  trainer.algorithm.off_policy_correction.sequence_mask_metric=$SEQUENCE_MASK_METRIC \
+  trainer.algorithm.off_policy_correction.geo_mask_high=$GEO_MASK_HIGH \
+  trainer.algorithm.off_policy_correction.geo_mask_low=$GEO_MASK_LOW \
   trainer.remove_microbatch_padding=$REMOVE_MICROBATCH_PADDING \
   trainer.epochs=20 \
   trainer.algorithm.eps_clip_low=$CLIP_RATIO_LOW \
@@ -111,7 +114,7 @@ uv run --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   trainer.policy_mini_batch_size=$MINI_BATCH_SIZE \
   trainer.micro_forward_batch_size_per_gpu=1 \
   trainer.micro_train_batch_size_per_gpu=1 \
-  trainer.max_tokens_per_microbatch=-1 \
+  trainer.max_tokens_per_microbatch=$MAX_TOKENS_PER_MICROBATCH \
   trainer.max_training_steps=100 \
   trainer.ckpt_interval=0 \
   trainer.max_prompt_length=$MAX_PROMPT_LENGTH \
