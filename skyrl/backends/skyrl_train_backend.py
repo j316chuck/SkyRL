@@ -575,6 +575,8 @@ class SkyRLTrainBackend(AbstractBackend):
             # A service-level prewarm owns the vLLM/router actors. A short-lived
             # adapter must not tear them down when its client session ends.
             self._dispatch.shutdown()
+            if self._colocate_pg is not None:
+                ray.util.remove_placement_group(self._colocate_pg.pg)
             self._model_ids_to_role = {}
             self._model_metadata = {}
             self._cfg = None

@@ -1,5 +1,7 @@
 """Regression coverage for retaining service-owned inference after model unload."""
 
+from unittest.mock import patch
+
 import pytest
 
 backend_module = pytest.importorskip("skyrl.backends.skyrl_train_backend")
@@ -21,16 +23,23 @@ def test_delete_model_keeps_prewarmed_inference():
     backend._dispatch = dispatch
     backend._cfg = object()
     backend._renderer = None
-    backend._colocate_pg = object()
+
+    class PlacementGroup:
+        pg = object()
+
+    placement_group = PlacementGroup()
+    backend._colocate_pg = placement_group
     backend._base_lora_signature = (8, 16)
     backend._inference_engine_client = object()
     backend._inference_engines_initialized = True
     backend._server_groups = []
     backend._inference_router = None
 
-    backend.delete_model("model")
+    with patch.object(backend_module.ray.util, "remove_placement_group") as remove_placement_group:
+        backend.delete_model("model")
 
     assert dispatch.stopped
+    remove_placement_group.assert_called_once_with(placement_group.pg)
     assert backend._model_ids_to_role == {}
     assert backend._inference_engines_initialized
     assert backend._inference_engine_client is not None
