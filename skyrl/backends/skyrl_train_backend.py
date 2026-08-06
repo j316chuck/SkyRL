@@ -47,7 +47,7 @@ class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
     All keys are applied as overrides to the default SkyRL-Train config.
     """
 
-    pass
+    keep_runtime_warm_on_last_unload: bool = False
 
 
 class FSDPBackendOverrides(SkyRLTrainBackendOverrides):
@@ -130,6 +130,7 @@ class SkyRLTrainBackend(AbstractBackend):
         self._tokenizer: AutoTokenizer = get_tokenizer(self.base_model)
         self._inference_engine_client = None
         self._inference_engines_initialized = False
+        self._inference_adapter_ids: set[str] = set()
         self._renderer = None
         # Captured at first LoRA create_model; subsequent create_models must
         # match this signature exactly. None when no LoRA model is registered.
@@ -403,12 +404,11 @@ class SkyRLTrainBackend(AbstractBackend):
             raise ValueError(f"Model '{model_id}' already exists")
 
         is_lora = lora_config is not None and lora_config.rank > 0
-        is_first_policy = "policy" not in self._model_ids_to_role.values()
+        runtime_is_initialized = self._dispatch is not None
 
-        # Multi-LoRA path: allow additional policy adapters when LoRA is active
-        # and the first model has already been built. FFT (rank=0) keeps the
-        # original single-tenant gate.
-        if model_role == "policy" and not is_first_policy:
+        # Register against an existing shared LoRA runtime, including when its
+        # previous final adapter was unloaded. FFT keeps the single-tenant gate.
+        if model_role == "policy" and runtime_is_initialized:
             if not is_lora:
                 raise ValueError(
                     "SkyRLTrainBackend already has a 'policy' model; multi-tenant "
@@ -499,21 +499,21 @@ class SkyRLTrainBackend(AbstractBackend):
     def delete_model(self, model_id: str) -> None:
         role = self._get_role(model_id)
 
-        # Multi-LoRA: if more than one model is currently registered, drop just
-        # this adapter slot rather than tearing down the shared Ray runtime.
-        # The live GPU state may still mirror this adapter; it'll be
-        # overwritten on the next swap_to (no eager swap-away here).
-        if len(self._model_ids_to_role) > 1:
-            if role == "policy" and self._base_lora_signature is not None:
-                self._dispatch.delete_adapter("policy", model_id)
-                del self._model_ids_to_role[model_id]
-                self._model_metadata.pop(model_id, None)
-                logger.info(f"Removed LoRA adapter '{model_id}'")
-                return
-            # Fall through to teardown for non-LoRA roles or unexpected mixes.
+        is_lora_policy = role == "policy" and self._base_lora_signature is not None
+        keep_runtime_warm = self.config.keep_runtime_warm_on_last_unload and is_lora_policy
+        if is_lora_policy and (len(self._model_ids_to_role) > 1 or keep_runtime_warm):
+            if model_id in self._inference_adapter_ids:
+                asyncio.run(self._inference_engine_client.unload_lora_adapter(model_id))
+                self._inference_adapter_ids.remove(model_id)
+            self._dispatch.delete_adapter("policy", model_id)
+            del self._model_ids_to_role[model_id]
+            self._model_metadata.pop(model_id, None)
+            logger.info(f"Removed LoRA adapter '{model_id}' and kept the shared runtime warm")
+            return
 
-        # Last model (or non-LoRA path): tear down the shared Ray runtime.
-        # The Tinker engine will rebuild on the next create_model().
+        self._shutdown_runtime(model_id)
+
+    def _shutdown_runtime(self, model_id: str) -> None:
         logger.info(f"Deleting model {model_id}, shutting down shared SkyRL-Train runtime...")
         for group in self._server_groups:
             group.shutdown()
@@ -528,6 +528,7 @@ class SkyRLTrainBackend(AbstractBackend):
         self._dispatch = None
         self._inference_engine_client = None
         self._inference_engines_initialized = False
+        self._inference_adapter_ids = set()
         self._renderer = None
         self._colocate_pg = None
         self._base_lora_signature = None
@@ -1176,6 +1177,8 @@ class SkyRLTrainBackend(AbstractBackend):
         # name. None for the FFT / single-tenant path uses legacy behavior.
         sync_id = model_id if self._base_lora_signature is not None else None
         asyncio.run(self._dispatch.save_weights_for_sampler(model_id=sync_id))
+        if sync_id is not None and _SKYRL_USE_NEW_INFERENCE:
+            self._inference_adapter_ids.add(model_id)
         logger.info(f"Synced weights for {model_id} to inference engines via NCCL")
 
         if persist:
