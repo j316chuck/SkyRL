@@ -569,6 +569,7 @@ class PPORayActorGroup:
         self.sequence_parallel_size = sequence_parallel_size
         self.record_memory = record_memory
         self._last_dp_size: Optional[int] = None
+        self._internal_pg = None
         self._initiate_actors(pg, num_gpus_per_actor)
 
     def _initiate_actors(self, pg: Optional[ResolvedPlacementGroup], num_gpus_per_actor: float):
@@ -612,6 +613,7 @@ class PPORayActorGroup:
 
             raw_pg = placement_group(bundles, strategy="PACK")
             get_ray_pg_ready_with_timeout(raw_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
+            self._internal_pg = raw_pg
 
         def _scheduling_strategy_for_rank(rank):
             if reordered_bundle_indices:
@@ -710,6 +712,9 @@ class PPORayActorGroup:
         """Terminate all workers in this training actor group."""
         for actor in self._actor_handlers:
             ray.kill(actor, no_restart=True)
+        if self._internal_pg is not None:
+            ray.util.remove_placement_group(self._internal_pg)
+            self._internal_pg = None
         self._actor_handlers = []
         self.actor_infos = []
 
