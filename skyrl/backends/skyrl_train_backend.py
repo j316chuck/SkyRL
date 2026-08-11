@@ -131,6 +131,10 @@ class SkyRLTrainBackend(AbstractBackend):
         self._tokenizer: AutoTokenizer = get_tokenizer(self.base_model)
         self._inference_engine_client = None
         self._inference_engines_initialized = False
+        # Tinker drives training request-by-request rather than through the
+        # normal SkyRL trainer loop, so it must advance the worker profiler
+        # lifecycle itself.
+        self._profiler_started = False
         self._renderer = None
         # CPU-only render server for multi-modal preprocessing; started
         # lazily on the first image-bearing training batch.
@@ -836,6 +840,9 @@ class SkyRLTrainBackend(AbstractBackend):
         if not prepared_batch.all_model_inputs:
             return {}
 
+        if not self._profiler_started and self._cfg.trainer.policy.torch_profiler_config.enable:
+            self._dispatch.start_profile("policy")
+            self._profiler_started = True
         self._sleep_inference_engines()
         results = {}
         for sub_batch in self._split_model_pass_batch_by_model_id(prepared_batch):
@@ -991,6 +998,8 @@ class SkyRLTrainBackend(AbstractBackend):
         self._dispatch.set_lr(role, adam_params.learning_rate, model_id=model_id)
 
         grad_norm = self._dispatch.optim_step(role, model_id=model_id)
+        if role == "policy" and self._profiler_started:
+            self._dispatch.profile_step("policy")
         logger.info(f"optim_step: lr={adam_params.learning_rate}, grad_norm={grad_norm}")
 
         metrics: dict[str, float] = {}
