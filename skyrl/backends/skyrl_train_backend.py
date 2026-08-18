@@ -26,6 +26,9 @@ from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,
     pad_training_input_batch,
 )
+from skyrl.backends.skyrl_train.utils.ppo_utils import (
+    apply_loss_reduction_to_advantages_minibatch,
+)
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
 from skyrl.backends.skyrl_train.workers.worker_utils import (
@@ -61,6 +64,21 @@ class FSDPBackendOverrides(SkyRLTrainBackendOverrides):
 
 class MegatronBackendOverrides(SkyRLTrainBackendOverrides):
     strategy: str = "megatron"
+
+
+def _apply_gspo_sequence_mean(batch: TrainingInputBatch) -> None:
+    """Pre-scale GSPO advantages so the worker's summed loss is a sequence mean."""
+    if "advantages" not in batch:
+        raise ValueError("GSPO forward_backward requires advantages for every response token")
+
+    loss_mask = batch["loss_mask"]
+    batch["advantages"] = apply_loss_reduction_to_advantages_minibatch(
+        batch["advantages"],
+        loss_mask,
+        loss_reduction="sequence_mean",
+        micro_batch_size=batch.batch_size,
+        max_seq_len=loss_mask.shape[-1],
+    )
 
 
 def _build_skyrl_train_config(
@@ -831,7 +849,7 @@ class SkyRLTrainBackend(AbstractBackend):
                 normalized_config["dppo"] = dppo_overrides
             return loss_fn, normalized_config or None
 
-        if loss_fn != "ppo":
+        if loss_fn not in {"ppo", "gspo"}:
             return loss_fn, loss_fn_config
 
         normalized_config = dict(loss_fn_config or {})
@@ -841,6 +859,9 @@ class SkyRLTrainBackend(AbstractBackend):
             normalized_config["eps_clip_low"] = 1.0 - clip_low_threshold
         if clip_high_threshold is not None:
             normalized_config["eps_clip_high"] = clip_high_threshold - 1.0
+        if loss_fn == "gspo":
+            normalized_config["loss_reduction"] = "sequence_mean"
+            return "gspo", normalized_config
         return "regular", normalized_config or None
 
     def forward_backward(
@@ -870,13 +891,6 @@ class SkyRLTrainBackend(AbstractBackend):
             )
         ):
             raise ValueError("Critic forward_backward requires values and returns for every response token")
-        batch = self._to_training_batch(prepared_batch, role)
-        micro_bs = (
-            self._cfg.trainer.micro_train_batch_size_per_gpu if self._cfg.trainer.strategy == "megatron" else None
-        )
-        batch, pad_size = self._pad_batch(batch, micro_batch_size=micro_bs)
-
-        loss_fn = prepared_batch.all_loss_fns[0]
         if len(set(prepared_batch.all_loss_fns)) > 1:
             logger.warning(
                 "SkyRL backend received mixed loss functions %s in one batch; using '%s' for all",
@@ -885,6 +899,16 @@ class SkyRLTrainBackend(AbstractBackend):
             )
         loss_fn_config = next((c for c in prepared_batch.all_loss_fn_configs if c is not None), None)
         loss_fn, loss_fn_config = self._normalize_policy_loss_request(role, loss_fn, loss_fn_config)
+        batch = self._to_training_batch(prepared_batch, role)
+        if role != "critic" and loss_fn == "gspo":
+            # Apply before padding so only real datums count toward the sequence
+            # mean. Group-relative advantages are computed by the client; each
+            # datum remains one independently weighted GSPO sequence here.
+            _apply_gspo_sequence_mean(batch)
+        micro_bs = (
+            self._cfg.trainer.micro_train_batch_size_per_gpu if self._cfg.trainer.strategy == "megatron" else None
+        )
+        batch, pad_size = self._pad_batch(batch, micro_batch_size=micro_bs)
         # Single model_id per sub-batch (split upstream); pass it so the
         # dispatch layer can swap to the right LoRA adapter before the op.
         model_id = prepared_batch.all_model_ids[0] if prepared_batch.all_model_ids else None
@@ -909,6 +933,8 @@ class SkyRLTrainBackend(AbstractBackend):
             per_sample_outputs = per_sample_outputs[:-pad_size]
 
         metrics = self._extract_metrics(data.metrics)
+        if loss_fn == "gspo" and "loss_metrics/clip_ratio" in data.metrics:
+            metrics["gspo/clipped_frac:mean"] = float(data.metrics["loss_metrics/clip_ratio"])
 
         results = {}
         for request_id, _, start_idx, end_idx in prepared_batch.request_batch_slices:
