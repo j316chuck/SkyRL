@@ -19,6 +19,8 @@ from skyrl.train.config import (
 
 logger = logging.getLogger(__name__)
 
+_NEMOTRON_35_LIGHTNING_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+
 
 def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
     """Return True when the trainer syncs LoRA adapters (not merged weights).
@@ -157,6 +159,15 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
     for key, value in engine_kwargs.items():
         setattr(args, key, value)
+
+    # Experimental performance arm: Nemotron 3.5 Lightning ships one native MTP
+    # head. Start with one draft token, vLLM's conservative correctness default,
+    # and leave every other model and explicit speculative config unchanged.
+    if (
+        cfg.trainer.policy.model.path == _NEMOTRON_35_LIGHTNING_MODEL
+        and args.speculative_config is None
+    ):
+        args.speculative_config = {"method": "mtp", "num_speculative_tokens": 1}
 
     return args
 

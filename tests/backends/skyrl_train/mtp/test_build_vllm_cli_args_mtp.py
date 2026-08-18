@@ -30,3 +30,39 @@ def test_build_vllm_cli_args_speculative_config_mtp(monkeypatch):
     cfg.generator.inference_engine.speculative_config = spec
     args = build_vllm_cli_args(cfg)
     assert args.speculative_config == spec
+
+
+@pytest.mark.vllm
+def test_nemotron_35_lightning_enables_one_mtp_draft_token(monkeypatch):
+    pytest.importorskip("vllm")
+    import vllm.platforms
+    from vllm.platforms.interface import UnspecifiedPlatform
+
+    monkeypatch.setattr(vllm.platforms, "_current_platform", UnspecifiedPlatform())
+
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.policy.model.path = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+
+    args = build_vllm_cli_args(cfg)
+
+    assert args.speculative_config == {"method": "mtp", "num_speculative_tokens": 1}
+
+
+@pytest.mark.vllm
+def test_nemotron_35_lightning_preserves_explicit_speculative_config(monkeypatch):
+    pytest.importorskip("vllm")
+    import vllm.platforms
+    from vllm.platforms.interface import UnspecifiedPlatform
+
+    monkeypatch.setattr(vllm.platforms, "_current_platform", UnspecifiedPlatform())
+
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.policy.model.path = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+    cfg.generator.inference_engine.speculative_config = {
+        "method": "mtp",
+        "num_speculative_tokens": 2,
+    }
+
+    args = build_vllm_cli_args(cfg)
+
+    assert args.speculative_config == {"method": "mtp", "num_speculative_tokens": 2}
