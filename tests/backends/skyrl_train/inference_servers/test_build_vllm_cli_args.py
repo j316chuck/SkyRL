@@ -40,6 +40,38 @@ def test_build_vllm_cli_args_succeeds_on_gpu_less_host(monkeypatch):
     # tests/backends/skyrl_train/mtp/test_build_vllm_cli_args_mtp.py
 
 
+@pytest.mark.vllm
+def test_nemotron_35_lightning_uses_fp32_mamba_ssm_cache(monkeypatch):
+    import vllm.platforms
+    from vllm.platforms.interface import UnspecifiedPlatform
+
+    monkeypatch.setattr(vllm.platforms, "_current_platform", UnspecifiedPlatform())
+
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.policy.model.path = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+    cfg.generator.inference_engine.engine_init_kwargs = {"mamba_ssm_cache_dtype": "float16"}
+
+    args = build_vllm_cli_args(cfg)
+
+    assert args.mamba_ssm_cache_dtype == "float32"
+
+
+@pytest.mark.vllm
+def test_other_models_preserve_fp16_mamba_ssm_cache(monkeypatch):
+    import vllm.platforms
+    from vllm.platforms.interface import UnspecifiedPlatform
+
+    monkeypatch.setattr(vllm.platforms, "_current_platform", UnspecifiedPlatform())
+
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.policy.model.path = "Qwen/Qwen3.6-27B"
+    cfg.generator.inference_engine.engine_init_kwargs = {"mamba_ssm_cache_dtype": "float16"}
+
+    args = build_vllm_cli_args(cfg)
+
+    assert args.mamba_ssm_cache_dtype == "float16"
+
+
 def test_resolve_policy_model_name_uses_served_model_name():
     cfg = SkyRLTrainConfig()
     cfg.trainer.policy.model.path = "base-model"

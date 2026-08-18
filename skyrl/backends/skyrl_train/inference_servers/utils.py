@@ -19,6 +19,8 @@ from skyrl.train.config import (
 
 logger = logging.getLogger(__name__)
 
+_NEMOTRON_35_LIGHTNING_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+
 
 def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
     """Return True when the trainer syncs LoRA adapters (not merged weights).
@@ -157,6 +159,11 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
     for key, value in engine_kwargs.items():
         setattr(args, key, value)
+
+    # Experimental parity arm: vLLM and the checkpoint both default Nemotron-H
+    # SSM state to FP32 because lower precision is not known to preserve accuracy.
+    if cfg.trainer.policy.model.path == _NEMOTRON_35_LIGHTNING_MODEL:
+        args.mamba_ssm_cache_dtype = "float32"
 
     return args
 
