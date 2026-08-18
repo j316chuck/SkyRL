@@ -167,6 +167,22 @@ def test_setup_replay_installs_indices_and_returns_model_mask(monkeypatch, paral
     assert routed_layer_counts == [1]
 
 
+def test_hybrid_replay_selects_global_moe_layer_routes(monkeypatch):
+    """Hybrid models only instantiate routers for their MoE layer positions."""
+    monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: (0, 7))
+    router_instances = [
+        SimpleNamespace(layer_number=2),
+        SimpleNamespace(layer_number=4),
+        SimpleNamespace(layer_number=7),
+    ]
+
+    assert replay_utils._get_local_router_layer_indices(
+        SimpleNamespace(),
+        global_num_layers=7,
+        instances=router_instances,
+    ) == [1, 3, 6]
+
+
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_replay_indices_are_dtype_independent(monkeypatch, parallel_state, packed, tp_size):

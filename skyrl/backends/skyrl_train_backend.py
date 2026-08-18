@@ -45,6 +45,8 @@ from skyrl.train.utils.utils import (
 from skyrl.utils.log import logger
 from skyrl.utils.tok import get_tokenizer
 
+_NEMOTRON_35_LIGHTNING_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+
 
 class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
     """Configuration overrides for the SkyRL-Train backend.
@@ -61,6 +63,17 @@ class FSDPBackendOverrides(SkyRLTrainBackendOverrides):
 
 class MegatronBackendOverrides(SkyRLTrainBackendOverrides):
     strategy: str = "megatron"
+
+
+def _apply_model_runtime_defaults(cfg: SkyRLTrainConfig, base_model: str) -> None:
+    """Apply correctness defaults required by exact model/runtime combinations."""
+    if base_model != _NEMOTRON_35_LIGHTNING_MODEL or cfg.trainer.strategy != "megatron":
+        return
+
+    cfg.generator.inference_engine.enable_return_routed_experts = True
+    megatron_cfg = cfg.trainer.policy.megatron_config
+    megatron_cfg.moe_enable_routing_replay = True
+    megatron_cfg.transformer_config_kwargs["moe_router_fusion"] = False
 
 
 def _build_skyrl_train_config(
@@ -92,6 +105,7 @@ def _build_skyrl_train_config(
     ), f"Only fsdp and megatron are supported for SkyRL-Train backend, got {overrides.strategy!r}"
     user_overrides["trainer.strategy"] = overrides.strategy
     cfg = SkyRLTrainConfig.from_cli_overrides(user_overrides)
+    _apply_model_runtime_defaults(cfg, base_model)
 
     # Disable scheduler - Tinker manages learning rate externally via set_lr()
     cfg.trainer.policy.optimizer_config.scheduler = "constant_with_warmup"

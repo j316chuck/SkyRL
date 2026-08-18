@@ -14,12 +14,38 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     build_logprobs_content,
     decode_packed_routed_experts,
     pack_routed_experts,
+    resolve_generate_lora_request,
 )
 
 
 @dataclass
 class _Logprob:
     logprob: float
+
+
+class _Models:
+    def __init__(self):
+        self.lora_requests = {"skyrl-lora": object()}
+
+    @staticmethod
+    def is_base_model(model_name):
+        return model_name == "base-model"
+
+
+@pytest.mark.parametrize("model_name", [None, "base-model"])
+def test_generate_model_selection_uses_base_model(model_name):
+    assert resolve_generate_lora_request(_Models(), model_name) is None
+
+
+def test_generate_model_selection_resolves_loaded_lora():
+    models = _Models()
+
+    assert resolve_generate_lora_request(models, "skyrl-lora") is models.lora_requests["skyrl-lora"]
+
+
+def test_generate_model_selection_rejects_unknown_model():
+    with pytest.raises(ValueError, match="missing-model"):
+        resolve_generate_lora_request(_Models(), "missing-model")
 
 
 @pytest.mark.parametrize(

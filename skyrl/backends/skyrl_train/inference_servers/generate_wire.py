@@ -25,6 +25,17 @@ CLAMPED_LOGPROB = -9999.0
 _DTYPES = {dtype.name: dtype for dtype in ROUTED_EXPERT_DTYPES}
 
 
+def resolve_generate_lora_request(models: Any, model_name: str | None) -> Any:
+    """Resolve the adapter selected by a ``/skyrl/v1/generate`` request."""
+    if not model_name or models.is_base_model(model_name):
+        return None
+
+    lora_request = models.lora_requests.get(model_name)
+    if lora_request is None:
+        raise ValueError(f"The model `{model_name}` does not exist.")
+    return lora_request
+
+
 def build_logprobs_content(
     token_ids: Iterable[int],
     resp_logprobs: Iterable[Optional[Mapping[int, Any]]],
