@@ -19,6 +19,8 @@ from skyrl.train.config import (
 
 logger = logging.getLogger(__name__)
 
+_NEMOTRON_35_LIGHTNING_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+
 
 def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
     """Return True when the trainer syncs LoRA adapters (not merged weights).
@@ -157,6 +159,13 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
     for key, value in engine_kwargs.items():
         setattr(args, key, value)
+
+    # Experimental performance arm: this model's TAU workload currently asks for
+    # eager execution even though LoRA+eager generation is 2-3x slower. Limit
+    # graph capture to decode so startup does not compile long prefill shapes.
+    if cfg.trainer.policy.model.path == _NEMOTRON_35_LIGHTNING_MODEL:
+        args.enforce_eager = False
+        args.compilation_config = {"cudagraph_mode": "FULL_DECODE_ONLY"}
 
     return args
 
