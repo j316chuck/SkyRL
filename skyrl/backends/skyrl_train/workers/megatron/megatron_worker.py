@@ -1423,6 +1423,11 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False):
             adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
 
+        # Keep the collective before rank 0 performs inference-server I/O. Under
+        # rollout load, load_lora_adapter can wait longer than Gloo's timeout;
+        # ranks waiting in a post-load barrier would poison the process group.
+        # The dispatcher's ray.get still waits for rank 0 before the next call.
+        torch.distributed.barrier()
         if torch.distributed.get_rank() == 0:
             os.makedirs(lora_sync_path, exist_ok=True)
 
@@ -1461,8 +1466,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
                 await inference_engine_client.update_named_weights(lora_request)
 
-        torch.distributed.barrier()
-
     async def broadcast_to_inference_engines(
         self,
         inference_engine_client: "InferenceEngineInterface",
@@ -1487,7 +1490,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         torch.cuda.empty_cache()
 
-        if self._is_lora and not self.cfg.policy.megatron_config.lora_config.merge_lora:
+        is_unmerged_lora = self._is_lora and not self.cfg.policy.megatron_config.lora_config.merge_lora
+        if is_unmerged_lora:
             # AdapterStore.swap_to has already made `model_id` the live adapter
             # before we get here; sync that adapter to vLLM under its own name
             # so sample(model=<model_id>) routes correctly. Single-tenant
@@ -1517,7 +1521,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # wanted by an inference engine, so empty regardless.
         if self._weight_transfer_sender.empty_cache_after_send or self.cfg.placement.colocate_all:
             torch.cuda.empty_cache()
-        torch.distributed.barrier()
+        if not is_unmerged_lora:
+            torch.distributed.barrier()
 
     def _set_pad_token_id(self, pad_token_id):
         # this already gets set in the init_model method

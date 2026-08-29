@@ -129,3 +129,41 @@ async def test_no_reset_when_prefix_caching_disabled(strategy, monkeypatch):
 
     client.reset_prefix_cache.assert_not_awaited()
     assert worker._weight_transfer_sender.send.await_args.kwargs["reset_prefix_cache"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.megatron
+async def test_unmerged_lora_sync_has_no_post_load_collective(monkeypatch):
+    worker = _make_worker(get_worker_cls("megatron"), handles_prefix_cache_reset=False)
+    worker._is_lora = True
+    worker._resolve_lora_sync_target = MagicMock(return_value=("adapter", "/tmp/adapter"))
+    worker._save_lora_adapters_and_sync = AsyncMock()
+    barrier = MagicMock()
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    client = AsyncMock()
+    await worker.broadcast_to_inference_engines(client, _ie_cfg(), model_id="model_a")
+
+    worker._save_lora_adapters_and_sync.assert_awaited_once_with("/tmp/adapter", client, lora_name="adapter")
+    barrier.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.megatron
+async def test_nonzero_rank_leaves_lora_sync_after_preload_barrier(monkeypatch):
+    worker_cls = get_worker_cls("megatron")
+    worker = worker_cls.__new__(worker_cls)
+    worker.actor_module = MagicMock()
+    worker.bridge = MagicMock()
+    worker.bridge.export_adapter_weights.return_value = []
+    barrier = MagicMock()
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    client = AsyncMock()
+
+    await worker._save_lora_adapters_and_sync("/tmp/adapter", client, lora_name="adapter")
+
+    barrier.assert_called_once_with()
+    assert not client.mock_calls
