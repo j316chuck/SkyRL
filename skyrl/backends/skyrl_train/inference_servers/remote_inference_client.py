@@ -1285,13 +1285,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
         upstream fix in https://github.com/vllm-project/vllm/pull/41482 lands
         in a vLLM release we depend on.
 
-        The custom endpoint (defined in vllm_server_actor.py) wraps add_lora
-        with load_inplace=True (so the engine reloads the freshly-written
-        safetensors) and then resets the cached LoRARequest's load_inplace=False
-        (so subsequent generates don't reload from disk on every step). This
-        avoids two vLLM 0.19.0 bugs that surface under colocate_all + tp=1 +
-        num_engines>=2 — see vllm_server_actor.py:_skyrl_load_lora_adapter for
-        the detailed explanation.
+        The custom endpoint (defined in vllm_server_actor.py) assigns each
+        reload a fresh global id. Requests already decoding retain the prior
+        generation until vLLM's bounded LoRA LRU retires it, avoiding both
+        stale in-place tensors and dangling active-batch adapter mappings.
 
         Args:
             lora_name: Name to register the adapter under on each server.
