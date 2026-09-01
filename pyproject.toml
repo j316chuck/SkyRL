@@ -146,6 +146,7 @@ megatron = [
     # metadata requires there, so the two agree without an override.
     "transformer-engine-cu13==2.16.0+cu.13.0; sys_platform == 'linux'",
     "flash-attn==2.8.3+cu.13.0.torch.2.11; sys_platform == 'linux'",
+    "flash-attn-3==3.0.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "flash-linear-attention; sys_platform == 'linux'",
     "causal-conv1d==1.6.2.post1+cu.13.0.torch.2.11; sys_platform == 'linux'",
     "mamba-ssm==2.3.2.post1+cu.13.0.torch.2.11; sys_platform == 'linux'",
@@ -279,6 +280,7 @@ override-dependencies = [
 
 [tool.uv.extra-build-dependencies]
 flash-attn = [{requirement = "torch", match-runtime = true}]
+flash-attn-3 = ["torch==2.11.0", "einops", "ninja", "packaging", "wheel"]
 fast-hadamard-transform = ["torch==2.11.0", "ninja"]
 
 [tool.uv.extra-build-variables]
@@ -335,6 +337,7 @@ flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == '
 # previously had to be a fork wheel with the local version stripped from METADATA —
 # otherwise TE rejected it and silently fell back to broken unfused attention.
 flash-attn = { index = "astral-cu130", marker = "sys_platform == 'linux'" }
+flash-attn-3 = { git = "https://github.com/Dao-AILab/flash-attention", rev = "ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820", subdirectory = "hopper", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
 causal-conv1d = { index = "astral-cu130", marker = "sys_platform == 'linux'" }
 mamba-ssm = { index = "astral-cu130", marker = "sys_platform == 'linux'" }
 # The TE trio must come from Astral as a set. Astral versions the core and torch
