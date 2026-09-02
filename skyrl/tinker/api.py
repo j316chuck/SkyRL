@@ -69,8 +69,11 @@ API_SERVER_STARTUP_ARGS = ["-m", "skyrl.tinker.api"]
 # Timeout for graceful shutdown when engine crashes
 SHUTDOWN_TIMEOUT_SECONDS = 10
 
-# How long retrieve_future waits for a result before returning 408
-RETRIEVE_FUTURE_TIMEOUT_SECONDS = 300
+# How long retrieve_future waits for a result before returning 408. Large
+# rollout bursts can legitimately queue behind the inference engine for many
+# minutes; returning 408 makes the SDK retry the whole sample and duplicate
+# inference work.
+RETRIEVE_FUTURE_TIMEOUT_SECONDS = 2_048
 
 # How long shutdown waits for in-flight forwarding tasks before cancelling them
 FORWARDING_SHUTDOWN_TIMEOUT_SECONDS = 10
