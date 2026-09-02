@@ -1466,7 +1466,10 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         sampling_session_id=request.sampling_session_id,
     )
     if req.app.state.external_future_store is not None:
-        request_id = req.app.state.external_future_store.create(model_id, sample_input)
+        try:
+            request_id, created = req.app.state.external_future_store.get_or_create(model_id, sample_input)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
     else:
         request_id = await create_future(
             session=session,
@@ -1477,8 +1480,9 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
             request_data=sample_input,
         )
         await session.commit()
+        created = True
 
-    if req.app.state.external_inference_client:
+    if created and req.app.state.external_inference_client:
         _start_forwarding_task(
             req.app,
             req.app.state.external_inference_client.call_and_store_result(
