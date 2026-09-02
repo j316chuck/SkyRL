@@ -589,9 +589,6 @@ async def test_sweep_evicts_entries_by_ttl(future_store):
     assert set(store._entries) == {retrieved_id, completed_id, pending_id}
 
     store._sweep(now + timedelta(seconds=ExternalFutureStore._RETRIEVED_TTL_SECONDS + 1))
-    assert set(store._entries) == {completed_id, pending_id}
-
-    store._sweep(now + timedelta(seconds=ExternalFutureStore._COMPLETED_TTL_SECONDS + 1))
     assert set(store._entries) == {pending_id}
 
     store._sweep(now + timedelta(seconds=ExternalFutureStore._PENDING_TTL_SECONDS + 1))

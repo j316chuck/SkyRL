@@ -34,11 +34,11 @@ class ExternalFutureStore:
     """
 
     _SWEEP_INTERVAL_SECONDS = 30.0
-    # Retrieved entries linger briefly so an SDK retry after a lost HTTP
-    # response still finds its result.
-    _RETRIEVED_TTL_SECONDS = 60.0
-    # Completed entries whose client never came back for them.
-    _COMPLETED_TTL_SECONDS = 600.0
+    # Keep terminal entries for the full client request window so an SDK retry
+    # after a lost HTTP response still finds its result.
+    _RETRIEVED_TTL_SECONDS = 2048.0
+    # Completed entries whose client has not retrieved them yet.
+    _COMPLETED_TTL_SECONDS = 2048.0
     # Pending entries whose forwarding task died without completing them.
     _PENDING_TTL_SECONDS = 3600.0
 
