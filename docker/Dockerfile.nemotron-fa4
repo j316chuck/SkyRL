@@ -1,0 +1,9 @@
+FROM us-central1-docker.pkg.dev/useful-memory-477923-v7/skyrl/megatron@sha256:585a527d0451d1c4ef3946ad0199c4b3aaf52fba13080a0ec015a9c66231c50c
+
+# Nemotron uses Mamba2. mamba-ssm 2.3.2 eagerly imports its unused Mamba3
+# TileLang implementation, whose vendored TVM is incompatible with the newer
+# tvm-ffi required by FlashAttention 4. Keep the Mamba2 runtime importable.
+RUN sed -i '/from mamba_ssm.modules.mamba3 import Mamba3/d' \
+    /opt/skyrl-env/SkyRL/.venv/lib/python3.12/site-packages/mamba_ssm/__init__.py \
+    && /opt/skyrl-env/SkyRL/.venv/bin/python -c \
+    'import flash_attn.cute.interface; import mamba_ssm; from mamba_ssm.modules.mamba2 import Mamba2'
