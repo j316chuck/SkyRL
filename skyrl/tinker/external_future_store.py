@@ -21,7 +21,6 @@ class ExternalFuture:
     result_data: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
-    retrieved_at: datetime | None = None
     event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -40,14 +39,11 @@ class ExternalFutureStore:
     # httpx timeout (with retries, potentially many minutes per task).
     _FORWARDING_SHUTDOWN_TIMEOUT_SECONDS = 10.0
     _SWEEP_INTERVAL_SECONDS = 30.0
-    # Grace kept after a result has been *delivered* to the client, so an SDK
-    # retry following a lost HTTP response still finds it. Measured from
-    # delivery (mark_retrieved), never from the in-store read: a large result
-    # can spend minutes being serialized and sent, and starting the clock at
-    # read would evict it mid-delivery.
-    _RETRIEVED_TTL_SECONDS = 2048.0
-    # Completed but not yet delivered — governs the read/serialize/send window
-    # and clients that never come back.
+    # Completed results remain retryable for one fixed window. Returning a
+    # response from ASGI only means its bytes reached the server transport; it
+    # is not a client acknowledgement. A separate, shorter "retrieved" window
+    # can therefore evict results that the SDK is still waiting to receive
+    # under heavy backpressure.
     _COMPLETED_TTL_SECONDS = 2048.0
     # Pending entries whose forwarding task died without completing them.
     _PENDING_TTL_SECONDS = 3600.0
@@ -107,18 +103,6 @@ class ExternalFutureStore:
             return None
         return entry.status, types.RequestType.EXTERNAL, entry.result_data
 
-    def mark_retrieved(self, request_id: int) -> None:
-        """Record that a result was delivered, starting its retry-grace clock.
-
-        Called by the endpoint after the response is serialized and handed to
-        the transport — not by wait() — so the short retrieved-TTL measures time
-        since delivery, and a slow in-flight delivery is never swept out from
-        under a retrying client.
-        """
-        entry = self._entries.get(request_id)
-        if entry is not None:
-            entry.retrieved_at = datetime.now(timezone.utc)
-
     async def complete(self, request_id: int, result_data: BaseModel, status: RequestStatus) -> None:
         entry = self._entries.get(request_id)
         if entry is None:
@@ -159,8 +143,6 @@ class ExternalFutureStore:
 
     def _sweep(self, now: datetime) -> None:
         def expired(entry: ExternalFuture) -> bool:
-            if entry.retrieved_at is not None:
-                return (now - entry.retrieved_at).total_seconds() > self._RETRIEVED_TTL_SECONDS
             if entry.completed_at is not None:
                 return (now - entry.completed_at).total_seconds() > self._COMPLETED_TTL_SECONDS
             return (now - entry.created_at).total_seconds() > self._PENDING_TTL_SECONDS

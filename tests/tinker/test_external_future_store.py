@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -26,6 +27,7 @@ from skyrl.tinker.db_models import (
 )
 from skyrl.tinker.external_future_store import ExternalFutureStore
 from skyrl.tinker.extra.skyrl_train_inference_forwarding import (
+    _FORWARDING_INFERENCE_TIMEOUT_SECONDS,
     SkyRLTrainInferenceForwardingClient,
 )
 
@@ -272,7 +274,6 @@ async def test_sustained_model_path_rollouts_training_futures_and_heartbeats(fut
                 )
             )
             assert all(response.body == expected_sample for response in retrievals)
-            assert all(store._entries[request_id].retrieved_at is not None for request_id in request_ids)
 
         repeated = await api.retrieve_future(api.RetrieveFutureRequest(request_id=str(request_ids[-1])), sample_request)
         assert repeated.body == expected_sample
@@ -311,9 +312,6 @@ async def test_retrieve_future_bounds_protobuf_serialization_off_event_loop(monk
                 types.RequestType.EXTERNAL,
                 types.SampleOutput(sequences=[]).model_dump_json(),
             )
-
-        def mark_retrieved(self, request_id):
-            pass
 
     def serialize_result_in_thread(request_type, result_data):
         nonlocal active_serializations, max_active_serializations
@@ -587,26 +585,69 @@ async def test_forwarding_client_completes_in_memory_future(future_store, monkey
 
 
 @pytest.mark.asyncio
+async def test_forwarding_client_allows_full_burst_timeout(future_store):
+    store, engine, _ = future_store
+    client = SkyRLTrainInferenceForwardingClient(EngineConfig(base_model="model_a"), engine, store)
+    try:
+        assert client._http_client.timeout.read == _FORWARDING_INFERENCE_TIMEOUT_SECONDS
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_forwarding_client_retries_vllm_server_error(future_store, monkeypatch):
+    store, engine, _ = future_store
+    client = SkyRLTrainInferenceForwardingClient(EngineConfig(base_model="model_a"), engine, store)
+    result = types.SampleOutput(sequences=[])
+    attempts = 0
+
+    async def resolve_proxy_url(*, force_refresh=False):
+        return "http://vllm"
+
+    async def forward(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            request = httpx.Request("POST", "http://vllm/v1/completions")
+            response = httpx.Response(500, request=request)
+            raise httpx.HTTPStatusError("transient vLLM failure", request=request, response=response)
+        return result
+
+    monkeypatch.setattr(client, "_resolve_proxy_url", resolve_proxy_url)
+    monkeypatch.setattr(client, "_forward", forward)
+    try:
+        actual = await client._forward_with_retry(SimpleNamespace(), "model_a", base_model="model_a")
+    finally:
+        await client.aclose()
+
+    assert actual == result
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
 async def test_sweep_evicts_entries_by_ttl(future_store):
     store, _, _ = future_store
     result = types.SampleOutput(sequences=[])
 
-    retrieved_id = store.create("model_a", _sample_input(1))
-    await store.complete(retrieved_id, result, RequestStatus.COMPLETED)
-    await store.wait(retrieved_id, timeout=1)
-    store.mark_retrieved(retrieved_id)
-    completed_id = store.create("model_a", _sample_input(2))
+    completed_id = store.create("model_a", _sample_input(1))
     await store.complete(completed_id, result, RequestStatus.COMPLETED)
-    pending_id = store.create("model_a", _sample_input(3))
+    pending_id = store.create("model_a", _sample_input(2))
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(external_future_store=store, future_waiters={})),
+        headers={},
+    )
+    await api.retrieve_future(api.RetrieveFutureRequest(request_id=str(completed_id)), request)
 
     now = datetime.now(timezone.utc)
     store._sweep(now)
-    assert set(store._entries) == {retrieved_id, completed_id, pending_id}
+    assert set(store._entries) == {completed_id, pending_id}
 
-    # A completed-but-undelivered entry (read via wait() but never marked
-    # delivered) must NOT be governed by the short retrieved-TTL: a slow
-    # in-flight delivery would otherwise be evicted out from under the client.
-    store._sweep(now + timedelta(seconds=ExternalFutureStore._RETRIEVED_TTL_SECONDS + 1))
+    # Returning an HTTP response is not a client acknowledgement. The completed
+    # future must therefore survive the former 120-second retrieved-result TTL.
+    store._sweep(now + timedelta(seconds=121))
+    assert set(store._entries) == {completed_id, pending_id}
+
+    store._sweep(now + timedelta(seconds=ExternalFutureStore._COMPLETED_TTL_SECONDS + 1))
     assert set(store._entries) == {pending_id}
 
     store._sweep(now + timedelta(seconds=ExternalFutureStore._PENDING_TTL_SECONDS + 1))
