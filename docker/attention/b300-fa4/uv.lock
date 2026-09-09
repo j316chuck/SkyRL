@@ -2548,8 +2548,8 @@ wheels = [
 
 [[package]]
 name = "megatron-bridge"
-version = "0.7.0+c0424a84"
-source = { git = "https://github.com/j316chuck/Megatron-Bridge?rev=c0424a842913e6a7c51776c864758323640aa696#c0424a842913e6a7c51776c864758323640aa696" }
+version = "0.7.0+7f9c4dc6"
+source = { git = "https://github.com/j316chuck/Megatron-Bridge?rev=7f9c4dc6c6a8c2c845d55cda2017016d6e8988df#7f9c4dc6c6a8c2c845d55cda2017016d6e8988df" }
 dependencies = [
     { name = "accelerate" },
     { name = "comet-ml" },
@@ -5205,7 +5205,7 @@ requires-dist = [
     { name = "litellm", marker = "extra == 'miniswe'" },
     { name = "loguru", marker = "extra == 'skyrl-train'" },
     { name = "mamba-ssm", marker = "sys_platform == 'linux' and extra == 'megatron'", specifier = "==2.3.2.post1+cu.13.0.torch.2.11", index = "https://wheels.astral.sh/simple/cu130/" },
-    { name = "megatron-bridge", marker = "python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/j316chuck/Megatron-Bridge?rev=c0424a842913e6a7c51776c864758323640aa696" },
+    { name = "megatron-bridge", marker = "python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/j316chuck/Megatron-Bridge?rev=7f9c4dc6c6a8c2c845d55cda2017016d6e8988df" },
     { name = "megatron-core", marker = "python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'megatron'", git = "https://github.com/NVIDIA/Megatron-LM?rev=14346b65a2d0790e451919858f7771078105c5f0" },
     { name = "mini-swe-agent", marker = "extra == 'miniswe'", specifier = ">=1.12.0" },
     { name = "mkdocs", marker = "extra == 'dev'" },
