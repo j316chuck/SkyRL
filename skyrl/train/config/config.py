@@ -122,6 +122,9 @@ class SkyRLLoraConfig(BaseConfig):
     share_expert_adapters: bool = True
     """Share one LoRA adapter across local grouped experts."""
 
+    use_transformer_engine_op_fuser: bool = False
+    """Fuse supported TP1 Transformer Engine LoRA branches without changing MoE kernels."""
+
     max_loras: int = 1
     """Maximum number of LoRA adapters that can be active concurrently in a
     single GPU batch. Maps to vLLM's ``max_loras``. Increase past 1 to enable

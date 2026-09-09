@@ -376,8 +376,8 @@ transformer-engine-torch = { index = "astral-cu130", marker = "sys_platform == '
 # CUDA torch on Linux, CPU torch on macOS (must match skyrl-train).
 # Linux uses the cu130 index (torch 2.11 wheels are published there).
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
-# Megatron Bridge with the identity-scale LoRA allocation fix.
-megatron-bridge = {git = "https://github.com/j316chuck/Megatron-Bridge", rev = "7f9c4dc6c6a8c2c845d55cda2017016d6e8988df", marker = "sys_platform == 'linux'"}
+# Megatron Bridge with LoRA-only Transformer Engine op-fuser selection.
+megatron-bridge = {git = "https://github.com/j316chuck/Megatron-Bridge", rev = "3caa91a40bb67d17b0a2aaea8be4ca4410680dbe", marker = "sys_platform == 'linux'"}
 # megatron-core must match the `3rdparty/Megatron-LM` submodule pin of the
 # megatron-bridge rev above -- that is the only megatron-core commit Bridge's
 # own CI validates against. Bump the two together, reading the submodule rev with
