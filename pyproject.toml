@@ -384,7 +384,7 @@ torchvision = [
 ]
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
 # Megatron Bridge with LoRA-only Transformer Engine op-fuser selection.
-megatron-bridge = {git = "https://github.com/j316chuck/Megatron-Bridge", rev = "9379a8492f9cdfcf808a7f56fc3004565381a74b", marker = "sys_platform == 'linux'"}
+megatron-bridge = {git = "https://github.com/j316chuck/Megatron-Bridge", rev = "f9423371cb1ba02d252c4dee1017b941fe8de5dd", marker = "sys_platform == 'linux'"}
 # megatron-core must match the `3rdparty/Megatron-LM` submodule pin of the
 # megatron-bridge rev above -- that is the only megatron-core commit Bridge's
 # own CI validates against. Bump the two together, reading the submodule rev with
