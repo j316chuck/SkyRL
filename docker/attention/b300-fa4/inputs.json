@@ -1,16 +1,16 @@
 {
-  "recipe_revision": "skyrl1",
+  "recipe_revision": "skyrl2",
   "skyrl_base_commit": "b58b96e81992c9cfe9b08b1c5ed6202ce8c6432e",
-  "combined_version": "2.8.3+cu.13.0.torch.2.11.fa4b28.skyrl1",
-  "companion_version": "4.0.0b28+skyrl1",
-  "release_repository": "NovaSky-AI/SkyRL",
-  "release_tag": "attention-fa2-2.8.3-fa4-4.0.0b28-skyrl1",
+  "combined_version": "2.8.3+cu.13.0.torch.2.11.fa4b28.skyrl2",
+  "companion_version": "4.0.0b28+skyrl2",
+  "release_repository": "j316chuck/SkyRL",
+  "release_tag": "attention-fa2-2.8.3-fa4-4.0.0b28-skyrl2",
   "requires_python": ">=3.12,<3.13",
   "runtime_pins": {
     "torch": "torch==2.11.0",
     "nvidia-cutlass-dsl": "nvidia-cutlass-dsl[cu13]==4.6.2",
     "quack-kernels": "quack-kernels[cu13]==0.6.4",
-    "apache-tvm-ffi": "apache-tvm-ffi==0.1.12"
+    "apache-tvm-ffi": "apache-tvm-ffi==0.1.10"
   },
   "inputs": {
     "fa2": {

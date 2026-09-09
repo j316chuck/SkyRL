@@ -1,21 +1,21 @@
 {
   "artifacts": [
     {
-      "filename": "flash_attn-2.8.3+cu.13.0.torch.2.11.fa4b28.skyrl1-cp312-cp312-manylinux_2_24_x86_64.whl",
-      "sha256": "62192506822d63ffee85ccadc6317be987abd87a3fe7e608c2ed49352bc0792c",
-      "size": 237200630,
-      "url": "https://github.com/oran-goodman/SkyRL/releases/download/attention-fa2-2.8.3-fa4-4.0.0b28-skyrl1/flash_attn-2.8.3%2Bcu.13.0.torch.2.11.fa4b28.skyrl1-cp312-cp312-manylinux_2_24_x86_64.whl"
+      "filename": "flash_attn-2.8.3+cu.13.0.torch.2.11.fa4b28.skyrl2-cp312-cp312-manylinux_2_24_x86_64.whl",
+      "sha256": "993815889c2d588a2854da80b2db1aa824f8ed4b1e5b14811351a3c0b4011803",
+      "size": 237200628,
+      "url": "https://github.com/j316chuck/SkyRL/releases/download/attention-fa2-2.8.3-fa4-4.0.0b28-skyrl2/flash_attn-2.8.3%2Bcu.13.0.torch.2.11.fa4b28.skyrl2-cp312-cp312-manylinux_2_24_x86_64.whl"
     },
     {
-      "filename": "flash_attn_4-4.0.0b28+skyrl1-py3-none-any.whl",
-      "sha256": "b87de78770f1689e69297aaf5510c6caca34b811cbe35768d3efa35cce865e78",
-      "size": 2361,
-      "url": "https://github.com/oran-goodman/SkyRL/releases/download/attention-fa2-2.8.3-fa4-4.0.0b28-skyrl1/flash_attn_4-4.0.0b28%2Bskyrl1-py3-none-any.whl"
+      "filename": "flash_attn_4-4.0.0b28+skyrl2-py3-none-any.whl",
+      "sha256": "ebe47d632b9fa797b9ee153ccc80b20b0c651595c6774c6c4d49b9830cb63a58",
+      "size": 2360,
+      "url": "https://github.com/j316chuck/SkyRL/releases/download/attention-fa2-2.8.3-fa4-4.0.0b28-skyrl2/flash_attn_4-4.0.0b28%2Bskyrl2-py3-none-any.whl"
     }
   ],
   "build": {
-    "combined_version": "2.8.3+cu.13.0.torch.2.11.fa4b28.skyrl1",
-    "companion_version": "4.0.0b28+skyrl1",
+    "combined_version": "2.8.3+cu.13.0.torch.2.11.fa4b28.skyrl2",
+    "companion_version": "4.0.0b28+skyrl2",
     "inputs": {
       "fa2": {
         "filename": "flash_attn-2.8.3+cu.13.0.torch.2.11-cp312-cp312-manylinux_2_24_x86_64.whl",
@@ -32,12 +32,12 @@
         "version": "4.0.0b28"
       }
     },
-    "recipe_revision": "skyrl1",
-    "release_repository": "NovaSky-AI/SkyRL",
-    "release_tag": "attention-fa2-2.8.3-fa4-4.0.0b28-skyrl1",
+    "recipe_revision": "skyrl2",
+    "release_repository": "j316chuck/SkyRL",
+    "release_tag": "attention-fa2-2.8.3-fa4-4.0.0b28-skyrl2",
     "requires_python": ">=3.12,<3.13",
     "runtime_pins": {
-      "apache-tvm-ffi": "apache-tvm-ffi==0.1.12",
+      "apache-tvm-ffi": "apache-tvm-ffi==0.1.10",
       "nvidia-cutlass-dsl": "nvidia-cutlass-dsl[cu13]==4.6.2",
       "quack-kernels": "quack-kernels[cu13]==0.6.4",
       "torch": "torch==2.11.0"
