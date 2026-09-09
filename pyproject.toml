@@ -384,7 +384,7 @@ torchvision = [
 ]
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
 # Megatron Bridge with the identity-scale LoRA allocation fix.
-megatron-bridge = {git = "https://github.com/j316chuck/Megatron-Bridge", rev = "d58974f8491500cd6d2c5f1f854ce728b6c5f393", marker = "sys_platform == 'linux'"}
+megatron-bridge = {git = "https://github.com/j316chuck/Megatron-Bridge", rev = "c0424a842913e6a7c51776c864758323640aa696", marker = "sys_platform == 'linux'"}
 # megatron-core must match the `3rdparty/Megatron-LM` submodule pin of the
 # megatron-bridge rev above -- that is the only megatron-core commit Bridge's
 # own CI validates against. Bump the two together, reading the submodule rev with
