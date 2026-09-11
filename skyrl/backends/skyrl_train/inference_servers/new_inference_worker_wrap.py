@@ -396,6 +396,7 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         from vllm.config import set_current_vllm_config
         from vllm.lora.lora_model import LoRAModel
         from vllm.lora.peft_helper import PEFTHelper
+        from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
         engine = self.weight_transfer_engine
         received: dict[str, torch.Tensor] = {}
@@ -430,9 +431,10 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
             weights_mapper=weights_mapper,
             skip_prefixes=getattr(manager.model, "lora_skip_prefixes", None),
         )
-        manager.remove_adapter(lora_int_id)
-        manager.add_adapter(model)
-        manager.activate_adapter(lora_int_id)
+        with gpu_sync_allowed():
+            manager.remove_adapter(lora_int_id)
+            manager.add_adapter(model)
+            manager.activate_adapter(lora_int_id)
         torch.accelerator.synchronize()
 
     # Suspend / resume for non-colocated weight sync.
