@@ -388,6 +388,53 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         torch.accelerator.synchronize()
         _empty_cuda_cache_rocm()
 
+    def update_lora_nccl(self, adapter_config: dict, lora_int_id: int, update_info: dict) -> None:
+        """Receive packed NCCL tensors and replace one resident LoRA adapter."""
+        if self.weight_transfer_engine is None:
+            raise RuntimeError("Weight transfer not configured. Please set weight_transfer_config to enable weight transfer.")
+
+        from vllm.config import set_current_vllm_config
+        from vllm.lora.lora_model import LoRAModel
+        from vllm.lora.peft_helper import PEFTHelper
+
+        engine = self.weight_transfer_engine
+        received: dict[str, torch.Tensor] = {}
+
+        def _capture_weights(weights):
+            for name, weight in weights:
+                # Packed transfer buffers are reused after this callback returns.
+                received[name] = weight.clone()
+            return set(received)
+
+        engine.set_weight_update_target(_LoadWeightsProxy(self.model_runner.model, _capture_weights), self.model_config)
+        try:
+            with set_current_vllm_config(self.vllm_config), torch.device(self.device):
+                engine.receive_weights(engine.parse_update_info(update_info))
+        finally:
+            engine.reset_weight_update_target()
+
+        lora_manager = self.model_runner.lora_manager
+        manager = lora_manager._adapter_manager
+        peft_helper = PEFTHelper.from_dict(adapter_config)
+        peft_helper.validate_legal(lora_manager.lora_config)
+        weights_mapper = getattr(manager.model, "hf_to_vllm_mapper", None)
+        if weights_mapper is not None:
+            weights_mapper = weights_mapper.get_unstacked_mapper()
+        model = LoRAModel.from_lora_tensors(
+            lora_int_id,
+            received,
+            peft_helper,
+            device=self.device,
+            dtype=lora_manager.lora_config.lora_dtype,
+            model_vocab_size=lora_manager.vocab_size,
+            weights_mapper=weights_mapper,
+            skip_prefixes=getattr(manager.model, "lora_skip_prefixes", None),
+        )
+        manager.remove_adapter(lora_int_id)
+        manager.add_adapter(model)
+        manager.activate_adapter(lora_int_id)
+        torch.accelerator.synchronize()
+
     # Suspend / resume for non-colocated weight sync.
     #
     # Drive the per-worker CuMemAllocator directly instead of GPUWorker.sleep/

@@ -1317,6 +1317,22 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
         return {url: resp for url, resp in results}
 
+    async def update_lora_adapter_nccl(
+        self,
+        lora_name: str,
+        adapter_config: Dict[str, Any],
+        update_info: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Install an adapter received through the initialized packed NCCL group."""
+        return await self._call_all_servers(
+            "/skyrl/v1/update_lora_adapter_nccl",
+            {
+                "lora_name": lora_name,
+                "adapter_config": adapter_config,
+                "update_info": update_info,
+            },
+        )
+
     async def unload_lora_adapter(self, lora_name: str) -> Dict[str, Any]:
         """
         Unload a previously-loaded LoRA adapter on all backend servers via /v1/unload_lora_adapter.

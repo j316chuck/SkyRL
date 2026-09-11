@@ -473,6 +473,39 @@ class VLLMServerActor(ServerActorProtocol):
                 "lora_int_id": lora_int_id,
             }
 
+        @app.post("/skyrl/v1/update_lora_adapter_nccl")
+        async def _skyrl_update_lora_adapter_nccl(request: Request):
+            """Receive and install a LoRA without staging safetensors on disk."""
+            body = await request.json()
+            lora_name = body.get("lora_name")
+            adapter_config = body.get("adapter_config")
+            update_info = body.get("update_info")
+            if not lora_name or not adapter_config or not update_info:
+                raise HTTPException(status_code=400, detail="lora_name, adapter_config, and update_info are required.")
+
+            models = request.app.state.openai_serving_models
+            async with models.lora_resolver_lock[lora_name]:
+                lora_int_id = (
+                    models.lora_requests[lora_name].lora_int_id
+                    if lora_name in models.lora_requests
+                    else models.lora_id_counter.inc(1)
+                )
+                await engine.collective_rpc(
+                    "update_lora_nccl",
+                    kwargs={
+                        "adapter_config": adapter_config,
+                        "lora_int_id": lora_int_id,
+                        "update_info": update_info,
+                    },
+                )
+                models.lora_requests[lora_name] = LoRARequest(
+                    lora_name=lora_name,
+                    lora_int_id=lora_int_id,
+                    lora_path="__skyrl_nccl_resident__",
+                    load_inplace=False,
+                )
+            return {"status": "ok", "lora_name": lora_name, "lora_int_id": lora_int_id}
+
         # NOTE (sumanthrh): We use a custom generate endpoint /skyrl/v1/generate because the native
         # endpoint /inference/v1/generate does not support returning routed expert IDs.
         # TODO (sumanthrh): Migrate back to /inference/v1/generate once this is fixed on the vllm side

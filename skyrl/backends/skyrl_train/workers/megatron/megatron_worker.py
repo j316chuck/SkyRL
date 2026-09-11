@@ -1,6 +1,7 @@
 import gc
 import os
 import shutil
+import time
 from collections import defaultdict
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -1608,9 +1609,15 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         )
         from safetensors.torch import save_file
 
+        use_nccl = os.environ.get("SKYRL_LORA_WEIGHT_SYNC_BACKEND") == "nccl"
         adapter_state = {}
-        for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False):
-            adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+        sync_started_at = time.perf_counter()
+        for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=not use_nccl, show_progress=False):
+            if torch.distributed.get_rank() == 0:
+                if use_nccl:
+                    adapter_state[f"base_model.model.{name}"] = tensor.to(dtype=torch.bfloat16).contiguous()
+                else:
+                    adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
 
         if torch.distributed.get_rank() == 0:
             os.makedirs(lora_sync_path, exist_ok=True)
@@ -1635,20 +1642,33 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 base_model_name_or_path=base_model_name_or_path,
             )
 
-            save_file(adapter_state, os.path.join(lora_sync_path, "adapter_model.safetensors"))
-            with open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
-                json.dump(adapter_config, f, ensure_ascii=False, indent=4)
+            if use_nccl:
+                from skyrl.backends.skyrl_train.weight_sync.broadcast_strategy import BroadcastWeightTransferSender
 
-            # Send LoRA disk loading request to inference engine.
-            from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
-                RemoteInferenceClient,
-            )
-
-            if isinstance(inference_engine_client, RemoteInferenceClient):
-                await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
+                if not isinstance(self._weight_transfer_sender, BroadcastWeightTransferSender):
+                    raise ValueError("SKYRL_LORA_WEIGHT_SYNC_BACKEND=nccl requires weight_sync_backend=nccl.")
+                await self._weight_transfer_sender.send_lora(adapter_state.items(), adapter_config, lora_name)
+                total_bytes = sum(tensor.nbytes for tensor in adapter_state.values())
+                elapsed = time.perf_counter() - sync_started_at
+                logger.info(
+                    "Packed NCCL LoRA sync completed: {:.2f} MiB in {:.3f}s ({:.2f} GiB/s)",
+                    total_bytes / 2**20,
+                    elapsed,
+                    total_bytes / 2**30 / elapsed,
+                )
             else:
-                lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
-                await inference_engine_client.update_named_weights(lora_request)
+                save_file(adapter_state, os.path.join(lora_sync_path, "adapter_model.safetensors"))
+                with open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+                    json.dump(adapter_config, f, ensure_ascii=False, indent=4)
+
+                # Send LoRA disk loading request to inference engine.
+                from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import RemoteInferenceClient
+
+                if isinstance(inference_engine_client, RemoteInferenceClient):
+                    await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
+                else:
+                    lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
+                    await inference_engine_client.update_named_weights(lora_request)
 
         torch.distributed.barrier()
 

@@ -202,6 +202,38 @@ class BroadcastWeightTransferSender(WeightTransferSender):
 
         torch.distributed.barrier()
 
+    async def send_lora(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        adapter_config: Dict[str, Any],
+        lora_name: str,
+    ) -> None:
+        """Transfer one adapter through vLLM's packed NCCL transport.
+
+        Unlike model weight sync, the receiver installs the tensors in vLLM's
+        LoRA manager rather than calling ``model.load_weights``. The HTTP
+        request is started before the trainer enters NCCL so all receiver ranks
+        join the collective first.
+        """
+        weights = list(weights)
+        if torch.distributed.get_rank() == 0:
+            update_info = {
+                "names": [name for name, _ in weights],
+                "dtype_names": [str(tensor.dtype).split(".")[-1] for _, tensor in weights],
+                "shapes": [list(tensor.shape) for _, tensor in weights],
+            }
+            update_task = asyncio.create_task(
+                self._inference_client.update_lora_adapter_nccl(lora_name, adapter_config, update_info)
+            )
+            await asyncio.to_thread(
+                nccl_trainer_send_weights,
+                iter(weights),
+                self._model_update_group,
+                packed=self._init_info.packed,
+            )
+            await update_task
+        torch.distributed.barrier()
+
     async def _send_serialized_fp8_chunks_vllm_native(
         self,
         chunks: Iterable[WeightChunk],
