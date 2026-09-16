@@ -62,7 +62,11 @@ def _build_config():
     cfg.trainer.logger = "console"
     cfg.trainer.critic.model.path = None
     cfg.trainer.policy.model.path = MODEL
-    cfg.trainer.policy.model.lora = SkyRLLoraConfig(rank=32, alpha=32)
+    cfg.trainer.policy.model.lora = SkyRLLoraConfig(
+        rank=32,
+        alpha=32,
+        lora_sync_path="/mnt/shared-volume/glm53flash-lora-sync",
+    )
     cfg.trainer.policy.model.lora.target_modules = ["linear_proj"]  # type: ignore
     cfg.trainer.policy.language_model_only = True
     cfg.trainer.ref.language_model_only = True
