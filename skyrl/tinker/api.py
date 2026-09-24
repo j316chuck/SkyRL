@@ -726,6 +726,12 @@ class ForwardBackwardRequest(BaseModel):
     seq_id: int | None = None
 
 
+class ForwardRequest(BaseModel):
+    model_id: str
+    forward_input: ForwardBackwardInput
+    seq_id: int | None = None
+
+
 class AdamParams(BaseModel):
     learning_rate: float = Field(default=1e-4, ge=0.0)
     beta1: float = Field(default=0.9, ge=0.0, lt=1.0)
@@ -1420,19 +1426,13 @@ _MAX_FWDBWD_BODY_BYTES = 1 << 30  # 1 GiB
 
 
 async def _read_forward_backward_request(request: Request) -> tuple[ForwardBackwardRequest, bool]:
-    """Read a protobuf forward_backward body.
+    """Read a forward_backward body in either supported wire format.
 
-    The tinker SDK submits the body as protobuf and routes forward-only passes
-    here via the proto's ``forward_only`` flag. Large bodies may arrive
-    zstd-compressed (``Content-Encoding: zstd``); ASGI servers do not decode
-    request bodies, so decompress here.
+    Newer SDKs submit protobuf and route forward-only passes here via the
+    proto's ``forward_only`` flag. Older SDKs submit JSON and use the separate
+    ``/forward`` endpoint. Large proto bodies may arrive zstd-compressed.
     """
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if content_type != PROTO_CONTENT_TYPE:
-        raise HTTPException(
-            status_code=415,
-            detail=f"forward_backward requires a {PROTO_CONTENT_TYPE} body (tinker SDK >= 0.25.0)",
-        )
     body = await request.body()
     if request.headers.get("content-encoding", "").strip().lower() == "zstd":
         try:
@@ -1440,11 +1440,13 @@ async def _read_forward_backward_request(request: Request) -> tuple[ForwardBackw
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"failed to zstd-decompress request body: {exc}") from exc
     try:
-        request_dict, forward_only = parse_forward_backward_request(body)
-    except (DecodeError, ValueError) as e:
-        raise HTTPException(status_code=422, detail=f"Invalid proto forward_backward body: {e}")
-    try:
-        return ForwardBackwardRequest.model_validate(request_dict), forward_only
+        if content_type == PROTO_CONTENT_TYPE:
+            try:
+                request_dict, forward_only = parse_forward_backward_request(body)
+            except (DecodeError, ValueError) as e:
+                raise HTTPException(status_code=422, detail=f"Invalid proto forward_backward body: {e}")
+            return ForwardBackwardRequest.model_validate(request_dict), forward_only
+        return ForwardBackwardRequest.model_validate_json(body), False
     except ValidationError as e:
         # Match FastAPI's native body validation error shape (422).
         raise FastAPIRequestValidationError(e.errors())
@@ -1462,6 +1464,23 @@ async def forward_backward(request: Request, session: AsyncSession = Depends(get
             model_id=req.model_id,
             request_data=req.forward_backward_input.to_types(),
             seq_id=req.seq_id,
+        )
+        await session.commit()
+
+    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+
+
+@app.post("/api/v1/forward", response_model=FutureResponse)
+async def forward(request: ForwardRequest, raw_request: Request, session: AsyncSession = Depends(get_session)):
+    """Forward pass to obtain logprobs without accumulating gradients."""
+    async with raw_request.app.state.db_write_lock:
+        await get_model(session, request.model_id)
+        request_id = await create_future(
+            session=session,
+            request_type=types.RequestType.FORWARD,
+            model_id=request.model_id,
+            request_data=request.forward_input.to_types(),
+            seq_id=request.seq_id,
         )
         await session.commit()
 

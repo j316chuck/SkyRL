@@ -1,4 +1,6 @@
+import asyncio
 import base64
+from types import SimpleNamespace
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -100,6 +102,39 @@ def test_datum_to_types_preserves_values_and_returns():
 
     assert datum.loss_fn_inputs.values.data == [0.1, 0.2, 0.3]
     assert datum.loss_fn_inputs.returns.data == [0.4, 0.5, 0.6]
+
+
+@pytest.mark.asyncio
+async def test_legacy_forward_creates_forward_future(monkeypatch):
+    created = {}
+
+    async def get_model(session, model_id):
+        assert model_id == "model_test"
+
+    async def create_future(**kwargs):
+        created.update(kwargs)
+        return 42
+
+    class Session:
+        async def commit(self):
+            created["committed"] = True
+
+    monkeypatch.setattr(api, "get_model", get_model)
+    monkeypatch.setattr(api, "create_future", create_future)
+    request = api.ForwardRequest(
+        model_id="model_test",
+        forward_input=api.ForwardBackwardInput(data=[_make_datum()], loss_fn="cross_entropy"),
+        seq_id=7,
+    )
+    raw_request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db_write_lock=asyncio.Lock())))
+
+    response = await api.forward(request, raw_request, Session())
+
+    assert response.request_id == "42"
+    assert created["request_type"] == types.RequestType.FORWARD
+    assert created["model_id"] == "model_test"
+    assert created["seq_id"] == 7
+    assert created["committed"]
 
 
 @pytest.mark.parametrize("optimizer", [False, True])

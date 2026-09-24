@@ -246,8 +246,8 @@ async def test_read_forward_backward_request_zstd_proto_body():
 
 
 @pytest.mark.asyncio
-async def test_read_forward_backward_request_json_body_raises_415():
-    """The JSON wire format of pre-0.25 SDKs is no longer accepted."""
+async def test_read_forward_backward_request_accepts_legacy_json_body():
+    """The JSON wire format keeps pre-0.25 training clients working."""
     req = api.ForwardBackwardRequest(
         model_id="model_json",
         forward_backward_input=api.ForwardBackwardInput(
@@ -263,11 +263,13 @@ async def test_read_forward_backward_request_json_body_raises_415():
             loss_fn="cross_entropy",
         ),
     )
-    for content_type in (None, "application/json", "application/x-protobuf-v2", "fooapplication/x-protobuf"):
+    for content_type in (None, "application/json"):
         headers = {} if content_type is None else {"content-type": content_type}
-        with pytest.raises(HTTPException) as exc_info:
-            await api._read_forward_backward_request(_StubRequest(req.model_dump_json().encode(), headers))
-        assert exc_info.value.status_code == 415
+        parsed, forward_only = await api._read_forward_backward_request(
+            _StubRequest(req.model_dump_json().encode(), headers)
+        )
+        assert parsed == req
+        assert not forward_only
 
 
 @pytest.mark.asyncio
