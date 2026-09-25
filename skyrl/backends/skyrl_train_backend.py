@@ -36,6 +36,11 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
 )
 from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.tinker import types
+from skyrl.tinker.debug_trace import (
+    fingerprint_models,
+    log_debug_trace,
+    model_debug_trace_enabled,
+)
 from skyrl.train.config import SkyRLTrainConfig, get_config_as_yaml_str
 from skyrl.train.utils.utils import (
     ResolvedPlacementGroup,
@@ -156,6 +161,13 @@ class SkyRLTrainBackend(AbstractBackend):
         # Captured at first LoRA create_model; subsequent create_models must
         # match this signature exactly. None when no LoRA model is registered.
         self._base_lora_signature: tuple | None = None
+        log_debug_trace(
+            "skyrl.backend.initialized",
+            runtime_base_model=self.base_model,
+            tokenizer_model=getattr(self._tokenizer, "name_or_path", ""),
+            backend_strategy=type(config).__name__,
+            source_sha=os.environ.get("SKYRL_SOURCE_SHA", ""),
+        )
 
         # New inference infrastructure
         self._server_groups: list = []
@@ -456,6 +468,15 @@ class SkyRLTrainBackend(AbstractBackend):
         return (int(lora_config.rank), int(lora_config.alpha))
 
     def create_model(self, model_id: str, lora_config: types.LoraConfig, model_role: str = "policy") -> None:
+        log_debug_trace(
+            "skyrl.backend.create_model",
+            enabled=model_debug_trace_enabled(model_id),
+            runtime_base_model=self.base_model,
+            model_id=model_id,
+            model_role=model_role,
+            lora_rank=lora_config.rank,
+            lora_seed=lora_config.seed,
+        )
         if model_id in self._model_ids_to_role:
             raise ValueError(f"Model '{model_id}' already exists")
 
@@ -916,6 +937,21 @@ class SkyRLTrainBackend(AbstractBackend):
         # Single model_id per sub-batch (split upstream); pass it so the
         # dispatch layer can swap to the right LoRA adapter before the op.
         model_id = prepared_batch.all_model_ids[0] if prepared_batch.all_model_ids else None
+        log_debug_trace(
+            "skyrl.backend.forward_backward_route",
+            enabled=model_debug_trace_enabled(model_id),
+            runtime_base_model=self.base_model,
+            configured_policy_model=self._cfg.trainer.policy.model.path,
+            model_id=model_id,
+            model_role=role,
+            loss_fn=loss_fn,
+            request_count=len(prepared_batch.request_batch_slices),
+            datum_count=len(prepared_batch.all_model_inputs),
+            action_token_count=sum(
+                sum(bool(weight) for weight in weights) for weights in prepared_batch.all_token_weights
+            ),
+            model_input_fingerprint=fingerprint_models(prepared_batch.all_model_inputs),
+        )
         if role == "critic":
             self._dispatch.set_algorithm_config(
                 "critic",
@@ -937,6 +973,14 @@ class SkyRLTrainBackend(AbstractBackend):
             per_sample_outputs = per_sample_outputs[:-pad_size]
 
         metrics = self._extract_metrics(data.metrics)
+        log_debug_trace(
+            "skyrl.backend.forward_backward_result",
+            enabled=model_debug_trace_enabled(model_id),
+            runtime_base_model=self.base_model,
+            model_id=model_id,
+            model_role=role,
+            metrics=metrics,
+        )
 
         results = {}
         for request_id, _, start_idx, end_idx in prepared_batch.request_batch_slices:
@@ -1034,6 +1078,15 @@ class SkyRLTrainBackend(AbstractBackend):
 
         grad_norm = self._dispatch.optim_step(role, model_id=model_id)
         logger.info(f"optim_step: lr={adam_params.learning_rate}, grad_norm={grad_norm}")
+        log_debug_trace(
+            "skyrl.backend.optimizer_result",
+            enabled=model_debug_trace_enabled(model_id),
+            runtime_base_model=self.base_model,
+            model_id=model_id,
+            model_role=role,
+            learning_rate=adam_params.learning_rate,
+            grad_norm=grad_norm,
+        )
 
         metrics: dict[str, float] = {}
         if grad_norm is not None:
@@ -1091,6 +1144,16 @@ class SkyRLTrainBackend(AbstractBackend):
             mid if (self._base_lora_signature is not None and mid in self._model_ids_to_role) else fallback_model_name
             for mid in prepared_batch.all_model_ids
         ]
+        log_debug_trace(
+            "skyrl.backend.sample_route",
+            enabled=any(model_debug_trace_enabled(model_id) for model_id in prepared_batch.all_model_ids),
+            runtime_base_model=self.base_model,
+            configured_policy_model=self._cfg.trainer.policy.model.path,
+            fallback_model=fallback_model_name,
+            training_model_ids=prepared_batch.all_model_ids,
+            inference_models=per_request_models,
+            sampling_session_ids=prepared_batch.all_session_ids,
+        )
 
         # Prompt logprobs are a property of the prompt, and all `num_samples`
         # samples of a request share one prompt, so only ask for them on the
@@ -1314,6 +1377,15 @@ class SkyRLTrainBackend(AbstractBackend):
         # before broadcasting and the worker registers it on vLLM under that
         # name. None for the FFT / single-tenant path uses legacy behavior.
         sync_id = model_id if self._base_lora_signature is not None else None
+        log_debug_trace(
+            "skyrl.backend.weight_sync_route",
+            enabled=model_debug_trace_enabled(model_id),
+            runtime_base_model=self.base_model,
+            configured_policy_model=self._cfg.trainer.policy.model.path,
+            model_id=model_id,
+            inference_adapter_id=sync_id,
+            persist=persist,
+        )
         asyncio.run(self._dispatch.save_weights_for_sampler(model_id=sync_id))
         if sync_id is not None:
             # The sync registered this tenant's adapter on vLLM; remember it

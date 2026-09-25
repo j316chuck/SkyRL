@@ -1,6 +1,7 @@
 """Background engine for processing training requests."""
 
 import argparse
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -24,6 +25,13 @@ from skyrl.tinker.db_models import (
     RequestStatus,
     SessionDB,
     enable_sqlite_wal,
+)
+from skyrl.tinker.debug_trace import (
+    debug_trace_enabled,
+    fingerprint_models,
+    log_debug_trace,
+    register_debug_model,
+    unregister_debug_model,
 )
 from skyrl.utils.log import logger
 
@@ -267,6 +275,7 @@ class TinkerEngine:
         backend_class, backend_config_class = get_backend_classes(config.backend, use_ray=use_ray)
         backend_config = backend_config_class(**config.backend_config)
         self.backend = backend_class(config.base_model, backend_config)
+        self._debug_contexts: dict[str, tuple[bool, dict[str, Any]]] = {}
 
         # Backends that support async sample routing notify us when their
         # inference endpoint changes; we persist it to EngineStateDB so the
@@ -279,6 +288,29 @@ class TinkerEngine:
         self._last_cleanup_time: float = time.time()
 
         logger.info(f"Initialized TinkerEngine with backend={type(self.backend).__name__}")
+
+    def _debug_context(self, model_id: str) -> tuple[bool, dict[str, Any]]:
+        cached = self._debug_contexts.get(model_id)
+        if cached is not None:
+            return cached
+        with Session(self.db_engine) as session:
+            model = session.get(ModelDB, model_id)
+            owner = session.get(SessionDB, model.session_id) if model is not None else None
+        metadata = owner.user_metadata if owner is not None else {}
+        enabled = debug_trace_enabled(metadata)
+        context = {
+            "xid": metadata.get("xid", ""),
+            "model_id": model_id,
+            "requested_base_model": model.base_model if model is not None else "",
+            "runtime_base_model": self.config.base_model,
+            "source_sha": os.environ.get("SKYRL_SOURCE_SHA", ""),
+            "session_id": model.session_id if model is not None else "",
+            "backend": self.config.backend,
+        }
+        self._debug_contexts[model_id] = (enabled, context)
+        if enabled:
+            register_debug_model(model_id)
+        return enabled, context
 
     @property
     def metrics(self) -> types.EngineMetrics:
@@ -512,10 +544,20 @@ class TinkerEngine:
 
     def process_create_model(self, model_id: str, request_data: types.CreateModelInput) -> types.CreateModelOutput:
         """Create and initialize a model."""
+        enabled, context = self._debug_context(model_id)
+        log_debug_trace(
+            "skyrl.engine.create_model_started",
+            enabled=enabled,
+            **context,
+            lora_rank=request_data.lora_config.rank,
+            lora_seed=request_data.lora_config.seed,
+            model_role=request_data.model_role,
+        )
         # Create model in backend (allocates adapter_index, creates optimizer, and configures adapter)
         self.backend.create_model(model_id, request_data.lora_config, model_role=request_data.model_role)
 
         logger.info(f"Created LoRA model {model_id}")
+        log_debug_trace("skyrl.engine.create_model_completed", enabled=enabled, **context)
 
         return types.CreateModelOutput(
             model_id=model_id,
@@ -536,6 +578,9 @@ class TinkerEngine:
                 session.commit()
 
             logger.info(f"Unloaded model {model_id}")
+
+        self._debug_contexts.pop(model_id, None)
+        unregister_debug_model(model_id)
 
         return types.UnloadModelOutput(model_id=model_id, status="unloaded")
 
@@ -587,6 +632,10 @@ class TinkerEngine:
                 # Model already missing in backend; only DB state needs cleanup.
                 unloaded_model_ids.add(model.model_id)
 
+        for model_id in unloaded_model_ids:
+            self._debug_contexts.pop(model_id, None)
+            unregister_debug_model(model_id)
+
         sessions_to_expire = [s.session_id for s in stale_sessions if s.session_id not in sessions_with_failed_unloads]
 
         # Apply DB status updates in one short write transaction.
@@ -613,12 +662,47 @@ class TinkerEngine:
         if not self.backend.has_model(model_id):
             return _model_not_found_error(model_id)
 
-        return self.backend.optim_step(model_id, request_data)
+        enabled, context = self._debug_context(model_id)
+        log_debug_trace(
+            "skyrl.engine.optimizer_started",
+            enabled=enabled,
+            **context,
+            learning_rate=request_data.adam_params.learning_rate,
+        )
+        result = self.backend.optim_step(model_id, request_data)
+        log_debug_trace(
+            "skyrl.engine.optimizer_completed",
+            enabled=enabled,
+            **context,
+            metrics=result.metrics if not isinstance(result, types.ErrorResponse) else {},
+        )
+        return result
 
     def process_forward_backward(self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]) -> dict:
         """Run forward and backward pass on a batch of requests."""
+        for model_id in sorted({model_id for model_id, _ in requests.values()}):
+            enabled, context = self._debug_context(model_id)
+            model_requests = [value for value_model_id, value in requests.values() if value_model_id == model_id]
+            log_debug_trace(
+                "skyrl.engine.forward_backward_started",
+                enabled=enabled,
+                **context,
+                request_ids=sorted(key for key, (value_model_id, _) in requests.items() if value_model_id == model_id),
+                request_count=len(model_requests),
+                datum_count=sum(len(value.data) for value in model_requests),
+                request_fingerprint=fingerprint_models(model_requests),
+            )
         prepared = prepare_model_pass_batch(requests)
-        return self.backend.forward_backward(prepared)
+        results = self.backend.forward_backward(prepared)
+        for model_id in sorted({model_id for model_id, _ in requests.values()}):
+            enabled, context = self._debug_context(model_id)
+            log_debug_trace(
+                "skyrl.engine.forward_backward_completed",
+                enabled=enabled,
+                **context,
+                result_count=len(results),
+            )
+        return results
 
     def process_forward(self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]) -> dict:
         """Run forward-only pass on a batch of requests."""
@@ -683,9 +767,26 @@ class TinkerEngine:
         # disk.  Backends can skip the expensive write in that case.
         persist = request_data.sampling_session_seq_id is None
 
+        enabled, context = self._debug_context(model_id)
+        log_debug_trace(
+            "skyrl.engine.weight_sync_started",
+            enabled=enabled,
+            **context,
+            checkpoint_id=checkpoint_id,
+            sampling_session_id=request_data.sampling_session_id,
+            persist=persist,
+        )
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
             self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist)
             logger.info(f"Saved sampler checkpoint for model {model_id} to {output_path}")
+        log_debug_trace(
+            "skyrl.engine.weight_sync_completed",
+            enabled=enabled,
+            **context,
+            checkpoint_id=checkpoint_id,
+            sampling_session_id=request_data.sampling_session_id,
+            persist=persist,
+        )
 
         # Return path=None when using sampling_session_seq_id and seq_id (SDK expects this)
         if request_data.sampling_session_seq_id is not None and request_data.seq_id is not None:

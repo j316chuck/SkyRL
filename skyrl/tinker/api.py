@@ -45,6 +45,11 @@ from skyrl.tinker.db_models import (
     enable_sqlite_wal,
     get_async_database_url,
 )
+from skyrl.tinker.debug_trace import (
+    debug_trace_enabled,
+    fingerprint_models,
+    log_debug_trace,
+)
 from skyrl.tinker.external_future_store import ExternalFutureStore
 from skyrl.tinker.extra import (
     ExternalInferenceClient,
@@ -288,6 +293,7 @@ async def lifespan(app: FastAPI):
     app.state.sampling_model_cache_lock = asyncio.Lock()
     app.state.validated_sampler_checkpoints = set()
     app.state.sampler_checkpoint_validation_lock = asyncio.Lock()
+    app.state.debug_trace_contexts = {}
 
     # Setup external inference client if configured.
     #
@@ -944,7 +950,11 @@ async def healthz():
 
 
 @app.post("/api/v1/create_session", response_model=CreateSessionResponse)
-async def create_session(request: CreateSessionRequest, session: AsyncSession = Depends(get_session)):
+async def create_session(
+    request: CreateSessionRequest,
+    raw_request: Request,
+    session: AsyncSession = Depends(get_session),
+):
     """Create a new session + persist in DB"""
     session_id = f"session_{uuid4().hex[:8]}"
     session_db = SessionDB(
@@ -956,6 +966,16 @@ async def create_session(request: CreateSessionRequest, session: AsyncSession = 
     )
     session.add(session_db)
     await session.commit()
+    enabled = debug_trace_enabled(session_db.user_metadata)
+    context = {
+        "xid": session_db.user_metadata.get("xid", ""),
+        "session_id": session_id,
+        "runtime_base_model": raw_request.app.state.engine_config.base_model,
+        "sdk_version": request.sdk_version,
+    }
+    if enabled:
+        raw_request.app.state.debug_trace_contexts[session_id] = context
+    log_debug_trace("skyrl.api.session_created", enabled=enabled, **context)
     return CreateSessionResponse(session_id=session_id)
 
 
@@ -1021,7 +1041,11 @@ async def get_sampler(sampler_id: str, session: AsyncSession = Depends(get_sessi
 
 
 @app.post("/api/v1/create_model", response_model=CreateModelResponse)
-async def create_model(request: CreateModelRequest, session: AsyncSession = Depends(get_session)):
+async def create_model(
+    request: CreateModelRequest,
+    raw_request: Request,
+    session: AsyncSession = Depends(get_session),
+):
     """Create a new model, optionally with a LoRA adapter."""
     # Validate session exists
     session_db = await session.get(SessionDB, request.session_id)
@@ -1053,6 +1077,24 @@ async def create_model(request: CreateModelRequest, session: AsyncSession = Depe
 
     await session.commit()
 
+    context = raw_request.app.state.debug_trace_contexts.get(request.session_id)
+    if context is not None:
+        context = {
+            **context,
+            "model_id": model_id,
+            "requested_base_model": request.base_model,
+            "runtime_base_model": raw_request.app.state.engine_config.base_model,
+        }
+        raw_request.app.state.debug_trace_contexts[model_id] = context
+        log_debug_trace(
+            "skyrl.api.model_created",
+            enabled=True,
+            **context,
+            request_id=str(request_id),
+            lora_rank=request.lora_config.rank,
+            lora_seed=seed,
+        )
+
     return CreateModelResponse(
         model_id=model_id,
         base_model=request.base_model,
@@ -1063,7 +1105,11 @@ async def create_model(request: CreateModelRequest, session: AsyncSession = Depe
 
 
 @app.post("/api/v1/unload_model", response_model=UnloadModelResponse)
-async def unload_model(request: UnloadModelRequest, session: AsyncSession = Depends(get_session)):
+async def unload_model(
+    request: UnloadModelRequest,
+    raw_request: Request,
+    session: AsyncSession = Depends(get_session),
+):
     """Unload a model and free all associated resources."""
     # Validate model exists
     model_db = await session.get(ModelDB, request.model_id)
@@ -1082,6 +1128,16 @@ async def unload_model(request: UnloadModelRequest, session: AsyncSession = Depe
     )
 
     await session.commit()
+
+    context = raw_request.app.state.debug_trace_contexts.pop(request.model_id, None)
+    if context is not None:
+        raw_request.app.state.debug_trace_contexts.pop(context["session_id"], None)
+        log_debug_trace(
+            "skyrl.api.model_unload_enqueued",
+            enabled=True,
+            **context,
+            request_id=str(request_id),
+        )
 
     return UnloadModelResponse(request_id=str(request_id), model_id=request.model_id)
 
@@ -1179,6 +1235,19 @@ async def forward_backward(request: Request, session: AsyncSession = Depends(get
         )
         await session.commit()
 
+    context = request.app.state.debug_trace_contexts.get(req.model_id)
+    if context is not None:
+        log_debug_trace(
+            "skyrl.api.forward_backward_enqueued",
+            enabled=True,
+            **context,
+            request_id=str(request_id),
+            seq_id=req.seq_id,
+            forward_only=forward_only,
+            datum_count=len(req.forward_backward_input.data),
+            request_fingerprint=fingerprint_models([req.forward_backward_input]),
+        )
+
     return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
 
 
@@ -1205,7 +1274,11 @@ async def forward(request: ForwardRequest, raw_request: Request, session: AsyncS
 
 
 @app.post("/api/v1/optim_step", response_model=FutureResponse)
-async def optim_step(request: OptimStepRequest, session: AsyncSession = Depends(get_session)):
+async def optim_step(
+    request: OptimStepRequest,
+    raw_request: Request,
+    session: AsyncSession = Depends(get_session),
+):
     """Update model using accumulated gradients."""
     await get_model(session, request.model_id)
 
@@ -1218,6 +1291,17 @@ async def optim_step(request: OptimStepRequest, session: AsyncSession = Depends(
     )
 
     await session.commit()
+
+    context = raw_request.app.state.debug_trace_contexts.get(request.model_id)
+    if context is not None:
+        log_debug_trace(
+            "skyrl.api.optimizer_enqueued",
+            enabled=True,
+            **context,
+            request_id=str(request_id),
+            seq_id=request.seq_id,
+            learning_rate=request.adam_params.learning_rate,
+        )
 
     return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
 
@@ -1297,7 +1381,11 @@ async def save_weights(request: SaveWeightsRequest, session: AsyncSession = Depe
 
 
 @app.post("/api/v1/save_weights_for_sampler", response_model=FutureResponse)
-async def save_weights_for_sampler(request: SaveWeightsForSamplerRequest, session: AsyncSession = Depends(get_session)):
+async def save_weights_for_sampler(
+    request: SaveWeightsForSamplerRequest,
+    raw_request: Request,
+    session: AsyncSession = Depends(get_session),
+):
     """Saves weights in a format compatible with sampling/inference servers."""
     # Get the model (validates it exists and gives us the session_id)
     model = await get_model(session, request.model_id)
@@ -1337,6 +1425,19 @@ async def save_weights_for_sampler(request: SaveWeightsForSamplerRequest, sessio
     )
 
     await session.commit()
+
+    context = raw_request.app.state.debug_trace_contexts.get(request.model_id)
+    if context is not None:
+        log_debug_trace(
+            "skyrl.api.weight_sync_enqueued",
+            enabled=True,
+            **context,
+            request_id=str(request_id),
+            checkpoint_id=checkpoint_id,
+            sampling_session_id=sampling_session_id,
+            sampling_session_seq_id=request.sampling_session_seq_id,
+            seq_id=request.seq_id,
+        )
 
     return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
 
@@ -1425,6 +1526,19 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
                 detail="model_path must be tinker://model_id/checkpoint_id or tinker://model_id/sampler_weights/checkpoint_id",
             )
         await validate_sampler_checkpoint_once(req, model_id, checkpoint_id, session)
+
+    context = req.app.state.debug_trace_contexts.get(model_id)
+    if context is not None:
+        log_debug_trace(
+            "skyrl.api.sample_routed",
+            enabled=True,
+            **context,
+            sampling_session_id=request.sampling_session_id,
+            checkpoint_id=checkpoint_id,
+            base_model=base_model,
+            model_path=model_path,
+            num_samples=request.num_samples,
+        )
 
     sample_input = types.SampleInput(
         base_model=base_model,

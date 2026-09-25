@@ -24,6 +24,7 @@ from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,
 )
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
+from skyrl.tinker.debug_trace import log_debug_trace, model_debug_trace_enabled
 from skyrl.train.config import SkyRLTrainConfig
 
 if TYPE_CHECKING:
@@ -98,6 +99,13 @@ class WorkerDispatch:
         """
         if model_id is None or role not in self._actor_groups:
             return
+        log_debug_trace(
+            "skyrl.worker_dispatch.adapter_selected",
+            enabled=model_debug_trace_enabled(model_id),
+            configured_policy_model=self.cfg.trainer.policy.model.path,
+            model_role=role,
+            model_id=model_id,
+        )
         self._ensure_on_gpu(role, need_optimizer=False, need_model=True)
         ray.get(self._actor_groups[role].async_run_ray_method("pass_through", "swap_to_adapter", model_id))
 
