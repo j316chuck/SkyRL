@@ -273,6 +273,15 @@ def _build_uv_run_cmd_engine(parent_cmd: list[str], engine_config: BaseModel) ->
     return cmd
 
 
+def _debug_trace_contexts(request: Request) -> dict[str, dict[str, Any]]:
+    """Return optional trace state, initializing it for lightweight app objects."""
+    contexts = getattr(request.app.state, "debug_trace_contexts", None)
+    if contexts is None:
+        contexts = {}
+        request.app.state.debug_trace_contexts = contexts
+    return contexts
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
@@ -975,7 +984,7 @@ async def create_session(
     session.add(session_db)
     await session.commit()
     if enabled:
-        raw_request.app.state.debug_trace_contexts[session_id] = context
+        _debug_trace_contexts(raw_request)[session_id] = context
     log_debug_trace("skyrl.api.session_created", enabled=enabled, **context)
     return CreateSessionResponse(session_id=session_id)
 
@@ -1078,7 +1087,8 @@ async def create_model(
 
     await session.commit()
 
-    context = raw_request.app.state.debug_trace_contexts.get(request.session_id)
+    contexts = _debug_trace_contexts(raw_request)
+    context = contexts.get(request.session_id)
     if context is not None:
         context = {
             **context,
@@ -1086,7 +1096,7 @@ async def create_model(
             "requested_base_model": request.base_model,
             "runtime_base_model": raw_request.app.state.engine_config.base_model,
         }
-        raw_request.app.state.debug_trace_contexts[model_id] = context
+        contexts[model_id] = context
         log_debug_trace(
             "skyrl.api.model_created",
             enabled=True,
@@ -1130,9 +1140,10 @@ async def unload_model(
 
     await session.commit()
 
-    context = raw_request.app.state.debug_trace_contexts.pop(request.model_id, None)
+    contexts = _debug_trace_contexts(raw_request)
+    context = contexts.pop(request.model_id, None)
     if context is not None:
-        raw_request.app.state.debug_trace_contexts.pop(context["session_id"], None)
+        contexts.pop(context["session_id"], None)
         log_debug_trace(
             "skyrl.api.model_unload_enqueued",
             enabled=True,
@@ -1236,7 +1247,7 @@ async def forward_backward(request: Request, session: AsyncSession = Depends(get
         )
         await session.commit()
 
-    context = request.app.state.debug_trace_contexts.get(req.model_id)
+    context = _debug_trace_contexts(request).get(req.model_id)
     if context is not None:
         log_debug_trace(
             "skyrl.api.forward_backward_enqueued",
@@ -1293,7 +1304,7 @@ async def optim_step(
 
     await session.commit()
 
-    context = raw_request.app.state.debug_trace_contexts.get(request.model_id)
+    context = _debug_trace_contexts(raw_request).get(request.model_id)
     if context is not None:
         log_debug_trace(
             "skyrl.api.optimizer_enqueued",
@@ -1427,7 +1438,7 @@ async def save_weights_for_sampler(
 
     await session.commit()
 
-    context = raw_request.app.state.debug_trace_contexts.get(request.model_id)
+    context = _debug_trace_contexts(raw_request).get(request.model_id)
     if context is not None:
         log_debug_trace(
             "skyrl.api.weight_sync_enqueued",
@@ -1528,7 +1539,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
             )
         await validate_sampler_checkpoint_once(req, model_id, checkpoint_id, session)
 
-    context = req.app.state.debug_trace_contexts.get(model_id)
+    context = _debug_trace_contexts(req).get(model_id)
     if context is not None:
         log_debug_trace(
             "skyrl.api.sample_routed",
