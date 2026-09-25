@@ -144,7 +144,7 @@ async def _sync(policy, client, cfg: SkyRLTrainConfig) -> None:
 @pytest.mark.asyncio
 @pytest.mark.h100
 async def test_looped_lora_one_step_roundtrip() -> None:
-    assert REPEAT_COUNT in {1, 2, 4}
+    assert REPEAT_COUNT in {1, 2, 4, 8}
     hf_config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
     cfg = _get_config(hf_config.num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
