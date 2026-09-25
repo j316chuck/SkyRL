@@ -73,6 +73,7 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
         max_input_length: int,
         sampling_params: Optional[Dict[str, Any]] = None,
         trajectory_id: Optional[TrajectoryID] = None,
+        cache_salt: Optional[str] = None,
     ) -> TrajectoryOutput:
         """Multi-turn VLM generation loop for a single trajectory.
         The conversation is treated as the source of truth and re-tokenized each step.
@@ -106,7 +107,7 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
             current_sampling_params: dict = (
                 sampling_params if sampling_params is not None else asdict(self.generator_cfg.sampling_params)
             )
-            get_logprobs = self.generator_cfg.sampling_params.logprobs is not None
+            get_logprobs = current_sampling_params.get("logprobs", None) is not None
             stop_strs = current_sampling_params.get("stop", None)
 
             # ── Accumulators ───────────────────────────────────────────────
@@ -154,6 +155,7 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
                     session_ids=[session_id],
                     sampling_params=current_sampling_params,
                     mm_features=[latest_features] if latest_features is not None else None,
+                    cache_salt=cache_salt,
                 )
                 engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
 

@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Hashable, List, Optional, Tuple, TypedDict
 
+from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertIndices
+
 if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.weight_sync import WeightUpdateRequest
     from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
@@ -29,6 +31,9 @@ class InferenceEngineInput(TypedDict):
     sampling_params: Optional[Dict[str, Any]]
     session_ids: Optional[List[Hashable]]
     mm_features: Optional[List[MultiModalFeatures]]
+    # Optional prefix-cache salt forwarded to vLLM as the request ``cache_salt`` so cache blocks are
+    # only shared between requests carrying the same salt. See ``GeneratorConfig.use_cache_salt``.
+    cache_salt: Optional[str]
 
 
 class InferenceEngineOutput(TypedDict):
@@ -44,7 +49,7 @@ class InferenceEngineOutput(TypedDict):
     stop_reasons: List[str]
     response_logprobs: Optional[List[List[float]]]
     prompt_logprobs: Optional[List[List[float]]]  # per-prompt-token logprobs under the current model
-    rollout_expert_indices: Optional[List[List[List[int]]]]  # [seq_len, layer_num, topk]
+    rollout_expert_indices: Optional[List[RoutedExpertIndices]]
 
 
 class InferenceEngineInterface(ABC):

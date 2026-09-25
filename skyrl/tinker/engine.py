@@ -1,11 +1,13 @@
 """Background engine for processing training requests."""
 
 import argparse
+import os
 import time
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from cloudpathlib import AnyPath
 from pydantic import BaseModel
@@ -24,7 +26,16 @@ from skyrl.tinker.db_models import (
     SessionDB,
     enable_sqlite_wal,
 )
+from skyrl.tinker.debug_trace import (
+    debug_trace_enabled,
+    fingerprint_models,
+    log_debug_trace,
+    register_debug_model,
+    unregister_debug_model,
+)
 from skyrl.utils.log import logger
+
+_MAX_IDS_PER_QUERY = 500
 
 
 def _model_not_found_error(model_id: str) -> types.ErrorResponse:
@@ -89,7 +100,14 @@ def prepare_sample_batch(
             all_session_ids.append(session_id)
 
         request_batch_slices.append(
-            (request_id, model_id, request_start, len(all_model_inputs), request_data.prompt_logprobs)
+            (
+                request_id,
+                model_id,
+                request_start,
+                len(all_model_inputs),
+                request_data.prompt_logprobs,
+                request_data.topk_prompt_logprobs,
+            )
         )
 
     return types.PreparedSampleBatch(
@@ -257,6 +275,7 @@ class TinkerEngine:
         backend_class, backend_config_class = get_backend_classes(config.backend, use_ray=use_ray)
         backend_config = backend_config_class(**config.backend_config)
         self.backend = backend_class(config.base_model, backend_config)
+        self._debug_contexts: dict[str, tuple[bool, dict[str, Any]]] = {}
 
         # Backends that support async sample routing notify us when their
         # inference endpoint changes; we persist it to EngineStateDB so the
@@ -269,6 +288,29 @@ class TinkerEngine:
         self._last_cleanup_time: float = time.time()
 
         logger.info(f"Initialized TinkerEngine with backend={type(self.backend).__name__}")
+
+    def _debug_context(self, model_id: str) -> tuple[bool, dict[str, Any]]:
+        cached = self._debug_contexts.get(model_id)
+        if cached is not None:
+            return cached
+        with Session(self.db_engine) as session:
+            model = session.get(ModelDB, model_id)
+            owner = session.get(SessionDB, model.session_id) if model is not None else None
+        metadata = owner.user_metadata if owner is not None else {}
+        enabled = debug_trace_enabled(metadata)
+        context = {
+            "xid": metadata.get("xid", ""),
+            "model_id": model_id,
+            "requested_base_model": model.base_model if model is not None else "",
+            "runtime_base_model": self.config.base_model,
+            "source_sha": os.environ.get("SKYRL_SOURCE_SHA", ""),
+            "session_id": model.session_id if model is not None else "",
+            "backend": self.config.backend,
+        }
+        self._debug_contexts[model_id] = (enabled, context)
+        if enabled:
+            register_debug_model(model_id)
+        return enabled, context
 
     @property
     def metrics(self) -> types.EngineMetrics:
@@ -335,6 +377,21 @@ class TinkerEngine:
                     )
                 session.commit()
 
+    def _load_requests(self, session: Session, requests: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+        """Append each request's request_data to its tuple, dropping any request that no longer exists.
+
+        Chunked to stay under SQLite's limit on bound parameters per statement.
+        """
+        request_ids = [request_id for request_id, *_ in requests]
+        payloads: dict[int, dict] = {}
+        for start in range(0, len(request_ids), _MAX_IDS_PER_QUERY):
+            chunk = request_ids[start : start + _MAX_IDS_PER_QUERY]
+            rows = session.exec(
+                select(FutureDB.request_id, FutureDB.request_data).where(FutureDB.request_id.in_(chunk))
+            ).all()
+            payloads.update(rows)
+        return [(request_id, *args, payloads[request_id]) for request_id, *args in requests if request_id in payloads]
+
     def _find_destructive_barriers(self, session: Session) -> dict[str, int]:
         """Find the earliest pending destructive operation (optim_step/load_weights) per model.
 
@@ -371,7 +428,7 @@ class TinkerEngine:
 
         # Get all pending operations of the requested type ordered by request_id
         query = (
-            select(FutureDB)
+            select(FutureDB.request_id, FutureDB.model_id)
             .where(FutureDB.request_type == request_type)
             .where(FutureDB.status == RequestStatus.PENDING)
             .order_by(FutureDB.request_id)
@@ -379,11 +436,15 @@ class TinkerEngine:
         ops = session.exec(query).all()
 
         # Filter: only include ops that come before their model's barrier
-        batchable = [op for op in ops if op.model_id not in barriers or op.request_id < barriers[op.model_id]]
+        batchable = [
+            (request_id, model_id)
+            for request_id, model_id in ops
+            if model_id not in barriers or request_id < barriers[model_id]
+        ]
 
         return {
-            str(f.request_id): (f.model_id, types.ForwardBackwardInput.model_validate(f.request_data))
-            for f in batchable
+            str(request_id): (model_id, types.ForwardBackwardInput.model_validate(request_data))
+            for request_id, model_id, request_data in self._load_requests(session, batchable)
         }
 
     def find_batchable_sample(self, session: Session) -> dict[str, tuple[str, types.SampleInput]]:
@@ -402,8 +463,9 @@ class TinkerEngine:
         Returns:
             Dict mapping request_id to (model_id, request_data) tuples
         """
+        # checkpoint_id is extracted in the database so prompts stay out of this query
         sample_query = (
-            select(FutureDB)
+            select(FutureDB.request_id, FutureDB.model_id, FutureDB.request_data["checkpoint_id"].as_string())
             .where(FutureDB.request_type == types.RequestType.SAMPLE)
             .where(FutureDB.status == RequestStatus.PENDING)
             .order_by(FutureDB.request_id)
@@ -412,19 +474,21 @@ class TinkerEngine:
 
         batchable = []
         model_checkpoints = {}  # Map from model_id to checkpoint_id of first request to that model
-        for op in sample_ops:
-            checkpoint_id = op.request_data["checkpoint_id"]
+        for request_id, model_id, checkpoint_id in sample_ops:
             # Base model requests (empty checkpoint_id) are always compatible, otherwise only
             # take only requests with one checkpoint_id for a given model_id
-            if checkpoint_id == "" or model_checkpoints.setdefault(op.model_id, checkpoint_id) == checkpoint_id:
-                batchable.append(op)
+            if not checkpoint_id or model_checkpoints.setdefault(model_id, checkpoint_id) == checkpoint_id:
+                batchable.append((request_id, model_id))
 
         # TODO: This leaks the abstraction by accessing backend-specific config.
         # We should find a better way to handle this going forward.
         if self.config.backend == "jax" and self.backend.config.sample_max_num_sequences > 0:
             batchable = batchable[: self.backend.config.sample_max_num_sequences]
 
-        return {str(f.request_id): (f.model_id, types.SampleInput.model_validate(f.request_data)) for f in batchable}
+        return {
+            str(request_id): (model_id, types.SampleInput.model_validate(request_data))
+            for request_id, model_id, request_data in self._load_requests(session, batchable)
+        }
 
     def find_single_requests(self, session: Session) -> dict[str, tuple[str, types.RequestType, dict]]:
         """Find all requests that need to be processed individually (not batchable).
@@ -456,7 +520,7 @@ class TinkerEngine:
                     blocked_pass_barriers.setdefault(model_id, req_id)
 
         statement = (
-            select(FutureDB)
+            select(FutureDB.request_id, FutureDB.model_id, FutureDB.request_type)
             .where(FutureDB.status == RequestStatus.PENDING)
             .where(FutureDB.request_type != types.RequestType.FORWARD_BACKWARD)
             .where(FutureDB.request_type != types.RequestType.FORWARD)
@@ -468,19 +532,32 @@ class TinkerEngine:
 
         # Filter: only include ops that come before the first blocked pass for their model
         other_futures = [
-            op
-            for op in other_futures
-            if op.model_id not in blocked_pass_barriers or op.request_id < blocked_pass_barriers[op.model_id]
+            (request_id, model_id, request_type)
+            for request_id, model_id, request_type in other_futures
+            if model_id not in blocked_pass_barriers or request_id < blocked_pass_barriers[model_id]
         ]
 
-        return {str(f.request_id): (f.model_id, f.request_type, f.request_data) for f in other_futures}
+        return {
+            str(request_id): (model_id, request_type, request_data)
+            for request_id, model_id, request_type, request_data in self._load_requests(session, other_futures)
+        }
 
     def process_create_model(self, model_id: str, request_data: types.CreateModelInput) -> types.CreateModelOutput:
         """Create and initialize a model."""
+        enabled, context = self._debug_context(model_id)
+        log_debug_trace(
+            "skyrl.engine.create_model_started",
+            enabled=enabled,
+            **context,
+            lora_rank=request_data.lora_config.rank,
+            lora_seed=request_data.lora_config.seed,
+            model_role=request_data.model_role,
+        )
         # Create model in backend (allocates adapter_index, creates optimizer, and configures adapter)
         self.backend.create_model(model_id, request_data.lora_config, model_role=request_data.model_role)
 
         logger.info(f"Created LoRA model {model_id}")
+        log_debug_trace("skyrl.engine.create_model_completed", enabled=enabled, **context)
 
         return types.CreateModelOutput(
             model_id=model_id,
@@ -501,6 +578,9 @@ class TinkerEngine:
                 session.commit()
 
             logger.info(f"Unloaded model {model_id}")
+
+        self._debug_contexts.pop(model_id, None)
+        unregister_debug_model(model_id)
 
         return types.UnloadModelOutput(model_id=model_id, status="unloaded")
 
@@ -552,6 +632,10 @@ class TinkerEngine:
                 # Model already missing in backend; only DB state needs cleanup.
                 unloaded_model_ids.add(model.model_id)
 
+        for model_id in unloaded_model_ids:
+            self._debug_contexts.pop(model_id, None)
+            unregister_debug_model(model_id)
+
         sessions_to_expire = [s.session_id for s in stale_sessions if s.session_id not in sessions_with_failed_unloads]
 
         # Apply DB status updates in one short write transaction.
@@ -578,12 +662,47 @@ class TinkerEngine:
         if not self.backend.has_model(model_id):
             return _model_not_found_error(model_id)
 
-        return self.backend.optim_step(model_id, request_data)
+        enabled, context = self._debug_context(model_id)
+        log_debug_trace(
+            "skyrl.engine.optimizer_started",
+            enabled=enabled,
+            **context,
+            learning_rate=request_data.adam_params.learning_rate,
+        )
+        result = self.backend.optim_step(model_id, request_data)
+        log_debug_trace(
+            "skyrl.engine.optimizer_completed",
+            enabled=enabled,
+            **context,
+            metrics=result.metrics if not isinstance(result, types.ErrorResponse) else {},
+        )
+        return result
 
     def process_forward_backward(self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]) -> dict:
         """Run forward and backward pass on a batch of requests."""
+        for model_id in sorted({model_id for model_id, _ in requests.values()}):
+            enabled, context = self._debug_context(model_id)
+            model_requests = [value for value_model_id, value in requests.values() if value_model_id == model_id]
+            log_debug_trace(
+                "skyrl.engine.forward_backward_started",
+                enabled=enabled,
+                **context,
+                request_ids=sorted(key for key, (value_model_id, _) in requests.items() if value_model_id == model_id),
+                request_count=len(model_requests),
+                datum_count=sum(len(value.data) for value in model_requests),
+                request_fingerprint=fingerprint_models(model_requests),
+            )
         prepared = prepare_model_pass_batch(requests)
-        return self.backend.forward_backward(prepared)
+        results = self.backend.forward_backward(prepared)
+        for model_id in sorted({model_id for model_id, _ in requests.values()}):
+            enabled, context = self._debug_context(model_id)
+            log_debug_trace(
+                "skyrl.engine.forward_backward_completed",
+                enabled=enabled,
+                **context,
+                result_count=len(results),
+            )
+        return results
 
     def process_forward(self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]) -> dict:
         """Run forward-only pass on a batch of requests."""
@@ -606,7 +725,7 @@ class TinkerEngine:
             self.config.checkpoints_base / request_data.source_model_id / f"{request_data.checkpoint_id}.tar.gz"
         )
 
-        self.backend.load_checkpoint(checkpoint_path, model_id)
+        self.backend.load_checkpoint(checkpoint_path, model_id, load_optimizer=request_data.load_optimizer)
 
         return types.LoadWeightsOutput(type="load_weights")
 
@@ -648,9 +767,26 @@ class TinkerEngine:
         # disk.  Backends can skip the expensive write in that case.
         persist = request_data.sampling_session_seq_id is None
 
+        enabled, context = self._debug_context(model_id)
+        log_debug_trace(
+            "skyrl.engine.weight_sync_started",
+            enabled=enabled,
+            **context,
+            checkpoint_id=checkpoint_id,
+            sampling_session_id=request_data.sampling_session_id,
+            persist=persist,
+        )
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
             self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist)
             logger.info(f"Saved sampler checkpoint for model {model_id} to {output_path}")
+        log_debug_trace(
+            "skyrl.engine.weight_sync_completed",
+            enabled=enabled,
+            **context,
+            checkpoint_id=checkpoint_id,
+            sampling_session_id=request_data.sampling_session_id,
+            persist=persist,
+        )
 
         # Return path=None when using sampling_session_seq_id and seq_id (SDK expects this)
         if request_data.sampling_session_seq_id is not None and request_data.seq_id is not None:
@@ -674,7 +810,12 @@ class TinkerEngine:
         params = [
             {
                 "request_id": int(request_id),
-                "result_data": result.model_dump(),
+                # `result_data` holds JSON text, so serialize straight to it:
+                # sample results may carry top-k logprobs for every prompt token,
+                # and the dict `model_dump()` builds would only exist for
+                # `json.dumps` to walk again -- several times the cost of
+                # `model_dump_json()`.
+                "result_data": result.model_dump_json(),
                 "status": RequestStatus.FAILED if isinstance(result, types.ErrorResponse) else RequestStatus.COMPLETED,
                 "completed_at": completed_at,
             }
@@ -728,6 +869,7 @@ class TinkerEngine:
         requests: dict[str, tuple[str, BaseModel]],
         processor: Callable[[dict[str, tuple[str, BaseModel]]], dict[str, BaseModel]],
         name: str,
+        per_model: bool = False,
     ):
         """Process a batch of requests with error handling and future completion.
 
@@ -735,21 +877,31 @@ class TinkerEngine:
             requests: Dict mapping request_id to (model_id, request_data) tuples
             processor: Function that processes requests and returns results dict
             name: Name for logging
+            per_model: Process one model's requests at a time, completing each
+                model's futures as soon as its sub-batch finishes (GPU execution
+                is serialized per model anyway; this only changes completion
+                granularity, not batching within a model).
         """
         if not requests:
             return
-        with log_timing(f"process_batch_requests({name}, n={len(requests)})"):
-            try:
-                error_results, valid_requests = self._filter_valid_requests(requests)
-                if valid_requests:
-                    results = processor(valid_requests)
-                    results.update(error_results)
-                else:
-                    results = error_results
-            except Exception as e:
-                logger.exception(f"Error processing batch: {e}")
-                results = {request_id: types.ErrorResponse(error=str(e), status="failed") for request_id in requests}
-        self._complete_futures(results)
+        error_results, valid_requests = self._filter_valid_requests(requests)
+        if error_results:
+            self._complete_futures(error_results)
+        if per_model:
+            grouped: dict[str, dict] = defaultdict(dict)
+            for request_id, item in valid_requests.items():
+                grouped[item[0]][request_id] = item
+            groups = list(grouped.values())
+        else:
+            groups = [valid_requests] if valid_requests else []
+        for group in groups:
+            with log_timing(f"process_batch_requests({name}, n={len(group)})"):
+                try:
+                    results = processor(group)
+                except Exception as e:
+                    logger.exception(f"Error processing batch: {e}")
+                    results = {request_id: types.ErrorResponse(error=str(e), status="failed") for request_id in group}
+            self._complete_futures(results)
 
     def process_pending_requests(self):
         """Main loop to process pending requests."""
@@ -767,8 +919,10 @@ class TinkerEngine:
                 other_requests = self.find_single_requests(session)
 
             # Process batches outside of session context
-            self.process_batch_requests(forward_backward_requests, self.process_forward_backward, "forward_backward")
-            self.process_batch_requests(forward_requests, self.process_forward, "forward")
+            self.process_batch_requests(
+                forward_backward_requests, self.process_forward_backward, "forward_backward", per_model=True
+            )
+            self.process_batch_requests(forward_requests, self.process_forward, "forward", per_model=True)
             self.process_batch_requests(sample_requests, self.process_sample, "sample")
 
             # Process other request types individually (in the future we can also batch independent optim_steps)

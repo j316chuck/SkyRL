@@ -16,10 +16,10 @@ from loguru import logger
 from omegaconf import OmegaConf
 from ray import ObjectRef
 from ray.util.placement_group import (
-    PlacementGroupSchedulingStrategy,
     placement_group,
     placement_group_table,
 )
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel
@@ -219,11 +219,70 @@ class DistributedTorchRayActor:
             LIBNUMA.numa_run_on_node_mask(bitmask)
             LIBNUMA.numa_set_membind(bitmask)
 
-        numa_nodes = LIBNUMA.numa_num_configured_nodes()
-        if numa_nodes <= 0:
-            numa_nodes = 1
-        num_gpu_pre_numa_node = max(1, 8 // numa_nodes)
-        target_nid = min(numa_nodes - 1, self._local_rank // num_gpu_pre_numa_node)
+        # Only bind to NUMA nodes that actually have CPUs. On Grace-Blackwell (GB200),
+        # GPU HBM is exposed as additional CPU-less NUMA nodes (e.g. 34 nodes total, only
+        # nodes 0-1 have CPUs).
+        cpu_nodes = []
+        node_root = "/sys/devices/system/node"
+        try:
+            node_names = sorted(
+                (n for n in os.listdir(node_root) if n.startswith("node") and n[4:].isdigit()),
+                key=lambda n: int(n[4:]),
+            )
+        except OSError:
+            node_names = []
+        for name in node_names:
+            try:
+                with open(os.path.join(node_root, name, "cpulist")) as f:
+                    if f.read().strip():
+                        cpu_nodes.append(int(name[4:]))
+            except OSError:
+                continue
+        if not cpu_nodes:
+            cpu_nodes = [0]
+
+        def gpu_numa_node():
+            """NUMA node of the GPU this worker owns, or None if it can't be determined.
+
+            Ray masks CUDA_VISIBLE_DEVICES down to this worker's single GPU, so cuda:0 is
+            that GPU and its PCI affinity is the exact answer -- no rank-to-socket heuristic
+            needed (and none works: with one visible device, GPU-count-based sharding sends
+            every rank but 0 to the last node).
+            """
+            try:
+                props = torch.cuda.get_device_properties(0)
+                bdf = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+            except Exception:
+                return None
+            pci_dev = f"/sys/bus/pci/devices/{bdf}"
+            try:
+                with open(f"{pci_dev}/numa_node") as f:
+                    nid = int(f.read().strip())
+                if nid in cpu_nodes:
+                    return nid
+            except (OSError, ValueError):
+                pass
+            # `numa_node` is -1 on single-socket hosts and can name a CPU-less HBM node on
+            # GB200; `local_cpulist` still points at the CPUs closest to the device.
+            try:
+                with open(f"{pci_dev}/local_cpulist") as f:
+                    cpulist = f.read().strip()
+                if not cpulist:
+                    return None
+                first_cpu = int(cpulist.split(",")[0].split("-")[0])
+                for entry in os.listdir(f"/sys/devices/system/cpu/cpu{first_cpu}"):
+                    if entry.startswith("node") and entry[4:].isdigit():
+                        nid = int(entry[4:])
+                        return nid if nid in cpu_nodes else None
+            except (OSError, ValueError):
+                return None
+            return None
+
+        target_nid = gpu_numa_node()
+        if target_nid is None:
+            # Fall back to spreading local ranks evenly over the CPU-bearing nodes.
+            num_gpu_per_numa_node = max(1, 8 // len(cpu_nodes))
+            target_nid = cpu_nodes[min(len(cpu_nodes) - 1, self._local_rank // num_gpu_per_numa_node)]
         numa_bind(target_nid)
         _SET_AFFINITY = True
 
@@ -233,6 +292,8 @@ class Worker(DistributedTorchRayActor):
         super().__init__(*args, **kwargs)
         self.cfg = cfg
         self._transfer_strategy_cls = None  # Set in init_weight_transfer_communicator
+        # Populated by init_model when torch profiling is enabled.
+        self.profiler = None
 
         if self.cfg.algorithm.temperature is None:
             raise ValueError("`cfg.algorithm.temperature` must be set")
@@ -242,8 +303,9 @@ class Worker(DistributedTorchRayActor):
         raise NotImplementedError()
 
     def empty_cache(self) -> None:
-        """Empty GPU memory cache on Worker's CUDA device"""
-        torch.cuda.empty_cache()
+        """Empty this worker's CUDA allocator cache."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _set_expandable_segments(self, enabled: bool) -> None:
         """Toggle PyTorch's CUDA ``expandable_segments`` allocator at runtime.
@@ -272,16 +334,34 @@ class Worker(DistributedTorchRayActor):
             logger.warning(f"Failed to set {setting!r}: {e}")
 
     @contextmanager
-    def _expandable_segments_disabled_for_sync(self):
+    def _expandable_segments_disabled_for_sync(self, force: bool = False):
         """Disable expandable_segments for the duration of CUDA-IPC weight sync.
 
-        Only toggles under ``colocate_all`` (the IPC path); under non-colocated runs
-        weight sync uses NCCL broadcast, which has its own buffers and is unaffected.
-        :meth:`_set_expandable_segments` itself no-ops when the feature is disabled.
+        By default only toggles under ``colocate_all`` (the colocated IPC path, which
+        only shares CUDA memory when trainer and inference share GPUs); under
+        non-colocated runs the push backends use NCCL broadcast, which has its own
+        buffers and is unaffected. ``force`` comes from the sender's
+        ``force_disable_expandable_segments``, for backends that CUDA-IPC share
+        regardless of colocation: sharded_rdt shares every gathered group with its
+        sidecar producer over ``reduce_tensor``/CUDA IPC, and expandable-segment
+        (VMM) memory makes that export/rebuild ~5-10x slower per storage
+        (measured: publish rebuild 7.2s/rank/sync at 30B, the dominant
+        weight-sync cost). :meth:`_set_expandable_segments` itself no-ops when
+        the feature is disabled.
         """
-        toggle = self.cfg.placement.colocate_all and self.cfg.use_expandable_segments
+        toggle = (force or self.cfg.placement.colocate_all) and self.cfg.use_expandable_segments
         if toggle:
             self._set_expandable_segments(False)
+            # The setting only affects NEW segment creation; freed blocks inside
+            # existing expandable segments are still eligible for reuse. Release
+            # cached segments so the gather buffers allocated during the sync
+            # land in fresh, IPC-fast classic segments. Once per process: later
+            # syncs re-use the classic blocks the first sync created (identical
+            # allocation sizes), and a per-sync empty_cache costs ~0.5-1s at
+            # 235B allocator scale.
+            if not getattr(self, "_ipc_segment_cache_flushed", False):
+                self._ipc_segment_cache_flushed = True
+                torch.cuda.empty_cache()
         try:
             yield
         finally:
@@ -292,11 +372,34 @@ class Worker(DistributedTorchRayActor):
         for key, value in kwargs.items():
             setattr(self.cfg.algorithm, key, value)
 
+    # ------------------------------------------------------------------
+    # torch.profiler RPCs, dispatched via WorkerDispatch pass_through.
+    # ------------------------------------------------------------------
+
+    def start_profile(self) -> None:
+        """Arm the profiler before the training loop (no-op when disabled)."""
+        if self.profiler is not None:
+            self.profiler.start()
+
+    def profile_step(self) -> None:
+        """Advance the profiler schedule by one global step."""
+        if self.profiler is not None:
+            self.profiler.step()
+
+    def stop_profile(self) -> None:
+        """Stop the profiler after the training loop, flushing any open window."""
+        if self.profiler is not None:
+            self.profiler.stop()
+
+    def dump_profiler_summary(self):
+        """Return this rank's last-window kernel summary, or None."""
+        return self.profiler.get_kernel_summary() if self.profiler is not None else None
+
     def _get_module_for_offload(self):
         """Return the model module(s) to be offloaded/backloaded. Megatron offloads `self.actor_module`. FSDP workers use `self.model` directly."""
         return self.model
 
-    def offload_to_cpu(self, offload_optimizer=True, offload_model=True):
+    def offload_to_cpu(self, offload_optimizer: bool = True, offload_model: bool = True):
         """Offload all worker state to CPU.
 
         After this function runs, only temporary reserved memory and torch's pre-loaded cuda kernels (~ GB) will remain.
@@ -313,7 +416,7 @@ class Worker(DistributedTorchRayActor):
             offload_model=offload_model,
         )
 
-    def backload_to_gpu(self, backload_optimizer=True, backload_model=True):
+    def backload_to_gpu(self, backload_optimizer: bool = True, backload_model: bool = True):
         """Backload worker state to GPU.
 
         Args:
@@ -387,6 +490,15 @@ class Worker(DistributedTorchRayActor):
         from skyrl.backends.skyrl_train.weight_sync import get_transfer_strategy_cls
 
         assert inference_engine_client is not None
+        # Cache the client so per-sync broadcast_to_inference_engines calls can
+        # pass None instead of re-shipping it: the client carries the HF
+        # tokenizer (~10MB, 0.13s pickle + 0.34s unpickle), which otherwise
+        # rides every sync's RPC fan-out. Workers only use its static parts
+        # (server URLs, cfg flags); the driver's live copy owns weight_version.
+        self._weight_sync_inference_client = inference_engine_client
+
+        # Fetch the total inference world size from the servers.
+        inference_world_size, _ = await inference_engine_client.get_world_size()
 
         # Determine transfer strategy based on inference engine config and placement
         self._transfer_strategy_cls = get_transfer_strategy_cls(
@@ -394,28 +506,36 @@ class Worker(DistributedTorchRayActor):
             colocate_all=self.cfg.placement.colocate_all,
         )
 
-        # Fetch the total inference world size from the servers.
-        inference_world_size, _ = await inference_engine_client.get_world_size()
-
         # Create init info on all ranks (it's deterministic from cfg or fetched world_size)
         init_info = self._transfer_strategy_cls.create_init_info(
-            inference_engine_cfg, inference_world_size=inference_world_size
+            inference_engine_cfg,
+            inference_world_size=inference_world_size,
+            base_model_path=self.cfg.policy.model.path,
         )
 
         # Create sender on all ranks
         # Strategy implementations may have different logic for different ranks
+        # The extractor is passed to every strategy; only those that rendezvous at
+        # init rather than on the first send use it (sharded_rdt). Both workers build
+        # it before calling super(), so it is available here.
         tasks = [
             asyncio.to_thread(
                 self._transfer_strategy_cls.create_sender,
                 init_info=init_info,
                 inference_client=inference_engine_client,
+                weight_extractor=getattr(self, "weight_extractor", None),
             ),
         ]
 
         # Only rank 0 initializes receivers on inference engines
         # NOTE: For broadcast strategy, sender and receiver init must run concurrently
         # because both need to join the same process group to avoid deadlock
-        if torch.distributed.get_rank() == 0:
+        # NOTE: strategies whose sender drives the inference-side handshake itself
+        # (sharded_rdt) must NOT be initialized from here as well.
+        # TODO (sumanthrh): `sender_initializes_receivers` is currently used as a workaround for
+        # supporting RDT. We can probably move the inference-side init
+        # as a sender method in all the classes to unify this. RDT doesn't call `init_weight_update_communicator` itself
+        if torch.distributed.get_rank() == 0 and not self._transfer_strategy_cls.sender_initializes_receivers:
             tasks.append(inference_engine_client.init_weight_update_communicator(init_info))
 
         results = await asyncio.gather(*tasks)
@@ -451,6 +571,12 @@ class Worker(DistributedTorchRayActor):
             node_local_rank=self.get_node_local_rank(),
             tokenizer=tokenizer,
         )
+
+    def finalize_pending_saves(self):
+        """Block until any in-flight async checkpoint write completes (no-op otherwise)."""
+        finalize = getattr(self.strategy, "finalize_pending_saves", None)
+        if finalize is not None:
+            finalize()
 
     def load_checkpoint(self, ckpt_dir: str, load_optimizer_states: bool = True, load_lr_scheduler_states: bool = True):
         _, states = self.strategy.load_checkpoint(
@@ -542,6 +668,7 @@ class PPORayActorGroup:
         self.colocate_all = colocate_all
         self.sequence_parallel_size = sequence_parallel_size
         self.record_memory = record_memory
+        self._last_dp_size: Optional[int] = None
         self._initiate_actors(pg, num_gpus_per_actor)
 
     def _initiate_actors(self, pg: Optional[ResolvedPlacementGroup], num_gpus_per_actor: float):
@@ -653,6 +780,8 @@ class PPORayActorGroup:
         ray.get([actor.init_worker_process_group.remote() for actor in self._actor_handlers])
         logger.info("Initialized process group for RayActorGroup")
         self.actor_infos = [ActorInfo(actor, ray.get(actor.get_mesh_rank.remote())) for actor in self._actor_handlers]
+        if self.actor_infos:
+            self._last_dp_size = self.actor_infos[0].rank.dp_size
         logger.info(f"Mesh Ranks: {[actor_info.rank for actor_info in self.actor_infos]}")
 
     def async_init_model(
@@ -668,12 +797,23 @@ class PPORayActorGroup:
         """
         return [actor.init_model.remote(*args, **kwargs) for actor in self._actor_handlers]
 
-    def offload_to_cpu(self, nonblocking=False, offload_optimizer=True, offload_model=True):
+    def get_dp_size(self) -> int:
+        """Return the current or last-known data-parallel size for this actor group."""
+        if self.actor_infos:
+            self._last_dp_size = self.actor_infos[0].rank.dp_size
+            return self._last_dp_size
+        if self._last_dp_size is None:
+            raise RuntimeError("Cannot determine data-parallel size before actor group initialization.")
+        return self._last_dp_size
+
+    def offload_to_cpu(self, nonblocking: bool = False, offload_optimizer: bool = True, offload_model: bool = True):
         """Offload all worker state to CPU.
 
         Args:
             nonblocking: Whether this operation is synchronous or asynchronous.
-            If `nonblocking=True`, then the function returns a list of object refs.
+                If `nonblocking=True`, then the function returns a list of object refs.
+            offload_optimizer: Whether to offload optimizer state.
+            offload_model: Whether to offload model parameters.
         """
         refs = [
             actor.offload_to_cpu.remote(offload_optimizer=offload_optimizer, offload_model=offload_model)
@@ -683,12 +823,14 @@ class PPORayActorGroup:
             return refs
         return ray.get(refs)
 
-    def backload_to_gpu(self, nonblocking=False, backload_optimizer=True, backload_model=True):
+    def backload_to_gpu(self, nonblocking: bool = False, backload_optimizer: bool = True, backload_model: bool = True):
         """Backload worker state to GPU
 
         Args:
             nonblocking: Whether this operation is synchronous or asynchronous.
-            If `nonblocking=True`, then the function returns a list of ObjectRefs.
+                If `nonblocking=True`, then the function returns a list of ObjectRefs.
+            backload_optimizer: Whether to backload optimizer state.
+            backload_model: Whether to backload model parameters.
         """
         refs = [
             actor.backload_to_gpu.remote(backload_optimizer=backload_optimizer, backload_model=backload_model)
@@ -698,7 +840,7 @@ class PPORayActorGroup:
             return refs
         return ray.get(refs)
 
-    def async_run_ray_method(self, dispatch_type: str, method_name: str, *args, **kwargs) -> List[ObjectRef]:
+    def async_run_ray_method(self, dispatch_type: str, method_name: str, *args: Any, **kwargs: Any) -> List[ObjectRef]:
         """Run a method on all actors using specified dispatch type asynchronously.
 
         Args:
@@ -735,6 +877,7 @@ class PolicyWorkerBase(Worker):
         data: TrainingInputBatch,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        return_per_token_outputs: bool = True,
     ) -> WorkerOutput:
         """
         Perform forward and backward passes for a batch, handling micro-batching internally.
@@ -748,6 +891,9 @@ class PolicyWorkerBase(Worker):
                      If provided, overrides the config's policy_loss_type.
             loss_fn_config: Optional config overrides for the loss function
                            (e.g., {"clip_low_threshold": 0.9} for PPO)
+            return_per_token_outputs: When False, skip building per-token
+                ``loss_fn_outputs`` (logprobs / elementwise NLL) for callers that
+                consume only scalar ``metrics`` (e.g. the SFT trainer).
 
         Returns:
             :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` and scalar
@@ -765,7 +911,11 @@ class PolicyWorkerBase(Worker):
             experience = BaseBatchIterator.batch_to_experience(microbatch)
             microbatch_weight = len(microbatch) / len(data)
             metrics = self._forward_backward_micro(
-                experience, microbatch_weight, loss_fn=loss_fn, loss_fn_config=loss_fn_config
+                experience,
+                microbatch_weight,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+                return_per_token_outputs=return_per_token_outputs,
             )
 
             # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
@@ -775,14 +925,10 @@ class PolicyWorkerBase(Worker):
             for k, v in metrics.items():
                 all_metrics[k].append(v)
 
-        # TODO: SFT path still averages metrics across microbatches and workers.
-        # This needs to be unified with the RL path which sums.
-        resolved_loss_name = loss_fn or self.cfg.algorithm.policy_loss_type
-        sum_loss_metrics = resolved_loss_name != "cross_entropy"
-
-        # Reduce across microbatches and all-reduce metrics across DP ranks
-        # NOTE: Sum loss metrics because scaling is already applied at the advantage level
-        result = reduce_metrics(all_metrics, sum_loss_metrics=sum_loss_metrics)
+        # Reduce across microbatches and all-reduce metrics across DP ranks.
+        # Loss metrics are pre-scaled sums, so keep the same sum-reduction
+        # shape for RL and SFT.
+        result = reduce_metrics(all_metrics, sum_loss_metrics=True)
 
         # Token-based batching diagnostics: total microbatches this rank ran and how many
         # were purely-padding (added to equalize the microbatch count across DP ranks).
@@ -793,7 +939,7 @@ class PolicyWorkerBase(Worker):
             result["num_padding_microbatches"] = float(getattr(microbatch_iterator, "num_padding_microbatches", 0))
 
         dp_group = self.device_mesh.get_group("dp")
-        result = all_reduce_metrics(result, self.strategy, group=dp_group, sum_loss_metrics=sum_loss_metrics)
+        result = all_reduce_metrics(result, self.strategy, group=dp_group, sum_loss_metrics=True)
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=result)
 
@@ -803,6 +949,7 @@ class PolicyWorkerBase(Worker):
         microbatch_weight: float,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        return_per_token_outputs: bool = True,
     ) -> Dict[str, float]:
         """
         Perform forward and backward pass for one micro batch.
@@ -813,7 +960,9 @@ class PolicyWorkerBase(Worker):
             loss_fn: Optional train loss function name to use instead of config default.
                 Public Tinker aliases such as ``ppo`` should be normalized by the backend
                 before reaching the worker.
-            loss_fn_config: Optional config overrides for the resolved train loss function
+            loss_fn_config: Optional config overrides for the resolved train loss function.
+            return_per_token_outputs: When False, skip building per-token
+                ``loss_fn_outputs`` when callers read only ``metrics``.
 
         Returns:
             Metrics dict for the worker's local micro batch
@@ -831,7 +980,7 @@ class PolicyWorkerBase(Worker):
         num_actions = experience.num_actions
         attention_mask = experience.attention_mask
         loss_mask = experience.loss_mask
-        action_mask = experience.action_mask
+        response_mask = experience.response_mask
         rollout_action_logprobs = experience.rollout_logprobs
 
         # Determine which loss function to use
@@ -845,7 +994,7 @@ class PolicyWorkerBase(Worker):
 
         # Build config for loss function, applying any overrides
         loss_config = self.cfg.algorithm
-        if loss_fn_config is not None:
+        if loss_fn_config:
             # Create a copy of the config and apply overrides
             # TODO: Fix nested overrides
             from dataclasses import asdict
@@ -881,47 +1030,57 @@ class PolicyWorkerBase(Worker):
 
         # SFT path: skip KL/entropy terms, return per-token outputs for Tinker API
         if resolved_loss_name == "cross_entropy":
+            # Policy loss masks are pre-scaled to achieve the correct reduction
+            # when summing across the entire minibatch (see `DefaultCollator`).
+            # FSDP averages loss value over DP ranks by default,
+            # so we multiply by dp_size to recover the correct sum reduction across workers.
+            grad_sum_correction_factor = self.mesh_rank.dp_size
+            loss = policy_loss * grad_sum_correction_factor
             unscaled_loss = policy_loss
-            loss = unscaled_loss * microbatch_weight
             self.strategy.backward(loss, self.model, self.optimizer)
 
-            # Compute elementwise loss for Tinker API (per-token NLL)
-            with torch.no_grad():
-                elementwise_loss = -action_log_probs
-                if loss_mask is not None:
-                    elementwise_loss = elementwise_loss * loss_mask
+            # Only build per-token outputs for callers that consume them.
+            if return_per_token_outputs:
+                # Tinker consumes per-token NLL.
+                with torch.no_grad():
+                    elementwise_loss = -action_log_probs
+                    if loss_mask is not None:
+                        elementwise_loss = elementwise_loss * loss_mask
 
-            # Build per-sequence loss_fn_outputs (matches Tinker's ForwardBackwardOutput structure)
-            # Trim to actual response length per sample (Tinker expects variable-length arrays
-            # that align with the input weights, not padded to batch max).
-            # Compute valid_lens vectorized on GPU, then move tensors to CPU exactly
-            # once before iterating in Python — avoids ~3N GPU->CPU syncs per micro-batch.
-            batch_size = action_log_probs.shape[0]
-            seq_len = action_log_probs.shape[1]
-            if action_mask is not None:
-                valid_lens_t = action_mask.sum(dim=-1).long()
-            elif loss_mask is not None:
-                valid_lens_t = loss_mask.sum(dim=-1).long()
+                # Build per-sequence loss_fn_outputs (matches Tinker's ForwardBackwardOutput
+                # structure). Trim to actual response length per sample (Tinker expects
+                # variable-length arrays that align with the input weights, not padded to
+                # batch max). Compute valid_lens vectorized on GPU, then move tensors to CPU
+                # exactly once before iterating in Python — avoids ~3N GPU->CPU syncs.
+                batch_size = action_log_probs.shape[0]
+                seq_len = action_log_probs.shape[1]
+                if response_mask is not None:
+                    valid_lens_t = response_mask.sum(dim=-1).long()
+                elif loss_mask is not None:
+                    valid_lens_t = (loss_mask > 0).sum(dim=-1).long()
+                else:
+                    valid_lens_t = torch.full((batch_size,), seq_len, device=action_log_probs.device, dtype=torch.long)
+
+                action_log_probs_cpu = action_log_probs.detach().cpu()
+                elementwise_loss_cpu = elementwise_loss.detach().cpu()
+                valid_lens = valid_lens_t.cpu().tolist()
+
+                loss_fn_outputs = []
+                for i in range(batch_size):
+                    valid_len = valid_lens[i]
+                    loss_fn_outputs.append(
+                        {
+                            "logprobs": action_log_probs_cpu[i, -valid_len:].tolist() if valid_len > 0 else [],
+                            "elementwise_loss": (
+                                elementwise_loss_cpu[i, -valid_len:].tolist() if valid_len > 0 else []
+                            ),
+                        }
+                    )
             else:
-                valid_lens_t = torch.full((batch_size,), seq_len, device=action_log_probs.device, dtype=torch.long)
-
-            # Bulk GPU->CPU sync: one transfer for logprobs, elementwise_loss, and valid_lens.
-            action_log_probs_cpu = action_log_probs.detach().cpu()
-            elementwise_loss_cpu = elementwise_loss.detach().cpu()
-            valid_lens = valid_lens_t.cpu().tolist()
-
-            loss_fn_outputs = []
-            for i in range(batch_size):
-                valid_len = valid_lens[i]
-                loss_fn_outputs.append(
-                    {
-                        "logprobs": action_log_probs_cpu[i, -valid_len:].tolist() if valid_len > 0 else [],
-                        "elementwise_loss": (elementwise_loss_cpu[i, -valid_len:].tolist() if valid_len > 0 else []),
-                    }
-                )
+                loss_fn_outputs = [{} for _ in range(action_log_probs.shape[0])]
 
             status = {
-                "loss": loss.item(),
+                "loss": unscaled_loss.item(),
                 "response_length": num_actions,
                 "lr": self.scheduler.get_last_lr()[0],
                 "loss_fn_outputs": loss_fn_outputs,
@@ -968,10 +1127,10 @@ class PolicyWorkerBase(Worker):
             batch_size = action_log_probs.shape[0]
             seq_len = action_log_probs.shape[1]
 
-            if action_mask is not None:
-                valid_lens = action_mask.sum(dim=1).int().tolist()
+            if response_mask is not None:
+                valid_lens = response_mask.sum(dim=1).int().tolist()
             elif loss_mask is not None:
-                valid_lens = loss_mask.sum(dim=1).int().tolist()
+                valid_lens = (loss_mask > 0).sum(dim=1).int().tolist()
             else:
                 valid_lens = [seq_len] * batch_size
 
@@ -1021,6 +1180,7 @@ class PolicyWorkerBase(Worker):
         data: TrainingInputBatch,
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        return_per_token_outputs: bool = True,
     ) -> WorkerOutput:
         """Run forward pass.
 
@@ -1033,6 +1193,10 @@ class PolicyWorkerBase(Worker):
           and returns a :class:`WorkerOutput` with per-sample ``loss_fn_outputs`` plus
           ``metrics`` (e.g. ``"loss"``).  Metrics are all-reduced across the DP group
           to mirror :meth:`forward_backward`.
+
+        ``return_per_token_outputs=False`` skips building the per-token
+        ``loss_fn_outputs`` on the loss path for callers that read only
+        ``metrics`` (e.g. SFT eval); it has no effect on the inference path.
         """
         if loss_fn is None:
             # Inference forward path: run in micro batches and emit per-sample logprobs.
@@ -1057,19 +1221,20 @@ class PolicyWorkerBase(Worker):
         all_loss_fn_outputs: List[Dict[str, Any]] = []
 
         for micro_batch in BatchIterator(data, micro_batch_size, drop_last=False):
-            metrics = self._forward_micro_with_loss(micro_batch, loss_fn=loss_fn, loss_fn_config=loss_fn_config)
+            metrics = self._forward_micro_with_loss(
+                micro_batch,
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+                return_per_token_outputs=return_per_token_outputs,
+            )
             if "loss_fn_outputs" in metrics:
                 all_loss_fn_outputs.extend(metrics.pop("loss_fn_outputs"))
             for k, v in metrics.items():
                 all_metrics[k].append(v)
 
-        # SFT path averages metrics across microbatches and DP ranks (mirror forward_backward).
-        resolved_loss_name = loss_fn or self.cfg.algorithm.policy_loss_type
-        sum_loss_metrics = resolved_loss_name != "cross_entropy"
-
-        result = reduce_metrics(all_metrics, sum_loss_metrics=sum_loss_metrics)
+        result = reduce_metrics(all_metrics, sum_loss_metrics=True)
         dp_group = self.device_mesh.get_group("dp")
-        result = all_reduce_metrics(result, self.strategy, group=dp_group, sum_loss_metrics=sum_loss_metrics)
+        result = all_reduce_metrics(result, self.strategy, group=dp_group, sum_loss_metrics=True)
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=result)
 
@@ -1078,12 +1243,20 @@ class PolicyWorkerBase(Worker):
         experience: Experience,
         loss_fn: str,
         loss_fn_config: Optional[Dict[str, Any]] = None,
+        return_per_token_outputs: bool = True,
     ) -> Dict[str, Any]:
         """Forward-only counterpart of :meth:`_forward_backward_micro`'s SFT branch.
 
         Runs the model + loss under ``torch.no_grad()`` (no backward, no KL/entropy terms),
         and returns the same metrics shape as the SFT branch of ``_forward_backward_micro``,
         minus ``lr`` (no optimizer state involved).
+
+        Args:
+            experience: Experience object for one micro batch.
+            loss_fn: Eval loss function name (e.g., "cross_entropy").
+            loss_fn_config: Optional config overrides for the resolved loss function.
+            return_per_token_outputs: When False, skip building per-token
+                ``loss_fn_outputs`` when callers read only ``metrics``.
         """
         self.model.eval()
         experience.to_device(torch.cuda.current_device())
@@ -1094,14 +1267,14 @@ class PolicyWorkerBase(Worker):
         num_actions = experience.num_actions
         attention_mask = experience.attention_mask
         loss_mask = experience.loss_mask
-        action_mask = experience.action_mask
+        response_mask = experience.response_mask
         rollout_action_logprobs = experience.rollout_logprobs
 
         current_loss_fn = PolicyLossRegistry.get(loss_fn)
 
         # Build config for loss function, applying any overrides
         loss_config = self.cfg.algorithm
-        if loss_fn_config is not None:
+        if loss_fn_config:
             from dataclasses import asdict
 
             new_loss_config = OmegaConf.merge(OmegaConf.create(asdict(loss_config)), OmegaConf.create(loss_fn_config))
@@ -1128,36 +1301,41 @@ class PolicyWorkerBase(Worker):
                 rollout_logprobs=rollout_action_logprobs,
             )
 
-            elementwise_loss = -action_log_probs
-            if loss_mask is not None:
-                elementwise_loss = elementwise_loss * loss_mask
+            # Only build per-token outputs for callers that consume them.
+            if return_per_token_outputs:
+                elementwise_loss = -action_log_probs
+                if loss_mask is not None:
+                    elementwise_loss = elementwise_loss * loss_mask
 
-            # Compute valid_lens vectorized on GPU, then move tensors to CPU
-            # exactly once before iterating in Python. Avoids ~3N GPU->CPU syncs
-            # per micro-batch (item()/cpu()/tolist() inside the per-sample loop).
-            batch_size = action_log_probs.shape[0]
-            seq_len = action_log_probs.shape[1]
-            if action_mask is not None:
-                valid_lens_t = action_mask.sum(dim=-1).long()
-            elif loss_mask is not None:
-                valid_lens_t = loss_mask.sum(dim=-1).long()
+                # Compute valid_lens vectorized on GPU, then move tensors to CPU
+                # exactly once before iterating in Python. Avoids ~3N GPU->CPU syncs
+                # per micro-batch (item()/cpu()/tolist() inside the per-sample loop).
+                batch_size = action_log_probs.shape[0]
+                seq_len = action_log_probs.shape[1]
+                if response_mask is not None:
+                    valid_lens_t = response_mask.sum(dim=-1).long()
+                elif loss_mask is not None:
+                    valid_lens_t = (loss_mask > 0).sum(dim=-1).long()
+                else:
+                    valid_lens_t = torch.full((batch_size,), seq_len, device=action_log_probs.device, dtype=torch.long)
+
+                action_log_probs_cpu = action_log_probs.detach().cpu()
+                elementwise_loss_cpu = elementwise_loss.detach().cpu()
+                valid_lens = valid_lens_t.cpu().tolist()
+
+                loss_fn_outputs = []
+                for i in range(batch_size):
+                    valid_len = valid_lens[i]
+                    loss_fn_outputs.append(
+                        {
+                            "logprobs": action_log_probs_cpu[i, -valid_len:].tolist() if valid_len > 0 else [],
+                            "elementwise_loss": (
+                                elementwise_loss_cpu[i, -valid_len:].tolist() if valid_len > 0 else []
+                            ),
+                        }
+                    )
             else:
-                valid_lens_t = torch.full((batch_size,), seq_len, device=action_log_probs.device, dtype=torch.long)
-
-            # Bulk GPU->CPU sync: one transfer for logprobs, elementwise_loss, and valid_lens.
-            action_log_probs_cpu = action_log_probs.detach().cpu()
-            elementwise_loss_cpu = elementwise_loss.detach().cpu()
-            valid_lens = valid_lens_t.cpu().tolist()
-
-            loss_fn_outputs = []
-            for i in range(batch_size):
-                valid_len = valid_lens[i]
-                loss_fn_outputs.append(
-                    {
-                        "logprobs": action_log_probs_cpu[i, -valid_len:].tolist() if valid_len > 0 else [],
-                        "elementwise_loss": (elementwise_loss_cpu[i, -valid_len:].tolist() if valid_len > 0 else []),
-                    }
-                )
+                loss_fn_outputs = [{} for _ in range(action_log_probs.shape[0])]
 
         return {
             "loss": policy_loss.item(),
