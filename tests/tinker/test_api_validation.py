@@ -3,6 +3,7 @@ import base64
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from pydantic import TypeAdapter, ValidationError
 
 from skyrl.tinker import api, types
@@ -146,6 +147,46 @@ def test_load_weights_request_preserves_optimizer_choice(optimizer):
     )
 
     assert request.optimizer is optimizer
+
+
+@pytest.mark.asyncio
+async def test_validate_training_checkpoint_uses_persisted_artifact_without_metadata(tmp_path):
+    checkpoint_path = tmp_path / "model_source" / "global_step_11.tar.gz"
+    checkpoint_path.parent.mkdir()
+    checkpoint_path.touch()
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(engine_config=SimpleNamespace(checkpoints_base=tmp_path)))
+    )
+    session = SimpleNamespace(get=lambda *_args: asyncio.sleep(0, result=None))
+
+    result = await api.validate_checkpoint(
+        request,
+        "model_source",
+        "global_step_11",
+        types.CheckpointType.TRAINING,
+        session,
+    )
+
+    assert result == checkpoint_path
+
+
+@pytest.mark.asyncio
+async def test_validate_training_checkpoint_rejects_missing_artifact(tmp_path):
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(engine_config=SimpleNamespace(checkpoints_base=tmp_path)))
+    )
+    session = SimpleNamespace(get=lambda *_args: asyncio.sleep(0, result=None))
+
+    with pytest.raises(HTTPException, match="Checkpoint not found") as exc_info:
+        await api.validate_checkpoint(
+            request,
+            "model_source",
+            "global_step_11",
+            types.CheckpointType.TRAINING,
+            session,
+        )
+
+    assert exc_info.value.status_code == 404
 
 
 # --- ModelInputChunk discriminator tests (api) ---
