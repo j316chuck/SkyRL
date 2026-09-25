@@ -1823,6 +1823,13 @@ async def validate_checkpoint(
     checkpoint_db = await session.get(CheckpointDB, (unique_id, checkpoint_id, checkpoint_type))
 
     if not checkpoint_db:
+        checkpoint_path = checkpoint_file_path(request, unique_id, checkpoint_id, checkpoint_type)
+        if checkpoint_type == types.CheckpointType.TRAINING and await asyncio.to_thread(checkpoint_path.exists):
+            logger.warning(
+                "Training checkpoint metadata is missing; loading persisted artifact %s",
+                checkpoint_path,
+            )
+            return checkpoint_path
         raise HTTPException(status_code=404, detail=f"Checkpoint not found: {unique_id}/{checkpoint_id}")
 
     if checkpoint_db.status == CheckpointStatus.PENDING:
