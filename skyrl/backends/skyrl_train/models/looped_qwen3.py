@@ -48,16 +48,32 @@ def _apply_lora_delta(layer: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
     return layer._apply_lora_to_output(inputs, output)
 
 
+def _apply_base_projection(layer: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+    if isinstance(layer, BaseLinearLayerWithLoRA):
+        output = layer.base_layer(inputs)
+    else:
+        output = layer(inputs)
+    if isinstance(output, tuple):
+        output = output[0]
+    return output
+
+
 def _apply_projection(
     layer: nn.Module,
     inputs: torch.Tensor,
     *,
-    lora_only: bool,
+    behavior: str,
 ) -> torch.Tensor:
-    if lora_only:
+    if behavior == "output_adapter":
         return _apply_lora_delta(layer, inputs)
-    output, _ = layer(inputs)
-    return output
+    if behavior == "base_feature":
+        return _apply_base_projection(layer, inputs)
+    if behavior == "full":
+        output = layer(inputs)
+        if isinstance(output, tuple):
+            output = output[0]
+        return output
+    raise ValueError(f"Unsupported looped LoRA projection behavior: {behavior!r}")
 
 
 class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
@@ -108,7 +124,7 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
         residual: torch.Tensor | None,
         execution_index: int,
         *,
-        lora_only: bool,
+        mode: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
@@ -116,10 +132,12 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        feature_behavior = "base_feature" if mode == "base_output_adapter" else mode
+        output_behavior = "output_adapter" if mode == "base_output_adapter" else mode
         qkv = _apply_projection(
             self.self_attn.qkv_proj,
             hidden_states,
-            lora_only=lora_only,
+            behavior=feature_behavior,
         )
         q, k, v = qkv.split(
             [self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size],
@@ -144,20 +162,20 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
         hidden_states = _apply_projection(
             self.self_attn.o_proj,
             hidden_states,
-            lora_only=lora_only,
+            behavior=output_behavior,
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = _apply_projection(
             self.mlp.gate_up_proj,
             hidden_states,
-            lora_only=lora_only,
+            behavior=feature_behavior,
         )
         hidden_states = self.mlp.act_fn(hidden_states)
         hidden_states = _apply_projection(
             self.mlp.down_proj,
             hidden_states,
-            lora_only=lora_only,
+            behavior=output_behavior,
         )
         return hidden_states, residual
 
@@ -188,9 +206,9 @@ class LoopedLoraQwen3Model(Qwen2Model):
         if not sections:
             raise ValueError("Fast looped LoRA requires at least one configured section")
         self.looped_lora_mode = getattr(config, "looped_lora_mode", "lora_only")
-        if self.looped_lora_mode not in {"lora_only", "full_block"}:
+        if self.looped_lora_mode not in {"lora_only", "base_output_adapter", "full_block"}:
             raise ValueError(
-                "Fast looped LoRA mode must be 'lora_only' or 'full_block', "
+                "Fast looped LoRA mode must be 'lora_only', 'base_output_adapter', or 'full_block', "
                 f"got {self.looped_lora_mode!r}"
             )
         schedule = build_looped_lora_schedule(config.num_hidden_layers, sections)
@@ -243,6 +261,11 @@ class LoopedLoraQwen3Model(Qwen2Model):
 
         hidden_states = inputs_embeds
         residual = None
+        loop_mode = {
+            "lora_only": "output_adapter",
+            "base_output_adapter": "base_output_adapter",
+            "full_block": "full",
+        }[self.looped_lora_mode]
         for execution_index, execution in enumerate(self.looped_lora_schedule):
             layer = self.layers[execution.physical_layer]
             if execution.lora_only:
@@ -251,7 +274,7 @@ class LoopedLoraQwen3Model(Qwen2Model):
                     hidden_states,
                     residual,
                     execution_index,
-                    lora_only=self.looped_lora_mode == "lora_only",
+                    mode=loop_mode,
                 )
             else:
                 hidden_states, residual = layer(positions, hidden_states, residual)
@@ -293,11 +316,7 @@ class SkyRLLoopedQwen3ForCausalLM(LocalArgmaxMixin, nn.Module, SupportsLoRA):
         )
         if config.tie_word_embeddings:
             tie_weights = getattr(self.lm_head, "tie_weights", None)
-            self.lm_head = (
-                tie_weights(self.model.embed_tokens)
-                if tie_weights is not None
-                else self.model.embed_tokens
-            )
+            self.lm_head = tie_weights(self.model.embed_tokens) if tie_weights is not None else self.model.embed_tokens
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 

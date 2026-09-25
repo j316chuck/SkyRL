@@ -45,3 +45,19 @@ def test_lora_delta_path_does_not_call_base_layer(
 def test_lora_delta_path_rejects_unwrapped_linear() -> None:
     with pytest.raises(RuntimeError, match="requires vLLM LoRA wrapping"):
         looped_qwen3._apply_lora_delta(torch.nn.Linear(2, 2), torch.ones(1, 2))
+
+
+def test_base_projection_bypasses_lora_delta(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeLoRALayer:
+        def __init__(self) -> None:
+            self.base_layer = lambda inputs: (inputs * 2, None)
+
+        def __call__(self, inputs: torch.Tensor):
+            raise AssertionError("combined base-plus-LoRA path must not run")
+
+    monkeypatch.setattr(looped_qwen3, "BaseLinearLayerWithLoRA", FakeLoRALayer)
+    inputs = torch.tensor([[1.0, 2.0]])
+
+    output = looped_qwen3._apply_base_projection(FakeLoRALayer(), inputs)
+
+    assert output.tolist() == [[2.0, 4.0]]

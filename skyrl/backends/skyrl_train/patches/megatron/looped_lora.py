@@ -13,6 +13,9 @@ from skyrl.train.looped_lora import LayerExecution, build_looped_lora_schedule
 _adapter_only: ContextVar[bool] = ContextVar("looped_lora_adapter_only", default=False)
 _loop_schedule_active: ContextVar[bool] = ContextVar("looped_lora_schedule_active", default=False)
 
+_BASE_FEATURE = "base_feature"
+_OUTPUT_ADAPTER = "output_adapter"
+
 
 @contextmanager
 def _set_context(variable: ContextVar[bool], value: bool) -> Iterator[None]:
@@ -75,6 +78,15 @@ def _looped_linear_forward(linear: nn.Module, inputs: torch.Tensor, *args: Any, 
     if not linear._adapter_enabled:
         raise RuntimeError("Looped LoRA extra passes require enabled LoRA adapters")
 
+    extra_behavior = getattr(linear, "_looped_lora_extra_behavior", _OUTPUT_ADAPTER)
+    if extra_behavior == _BASE_FEATURE:
+        output, bias, _ = linear.base_linear_forward(inputs, *args, **kwargs)
+        if linear._base_returns_tuple:
+            return output, bias
+        return output
+    if extra_behavior != _OUTPUT_ADAPTER:
+        raise RuntimeError(f"Unsupported looped LoRA linear behavior: {extra_behavior!r}")
+
     adapter_inputs = _normalize_adapter_input(linear, inputs).contiguous()
     output = linear.adapter_forward(linear.adapter, adapter_inputs, *args, **kwargs)
     if linear._base_returns_tuple:
@@ -130,7 +142,7 @@ def _looped_block_forward(block: nn.Module, *args: Any, **kwargs: Any):
 
 def install_looped_lora(model: nn.Module | Sequence[nn.Module], sections: Sequence[dict[str, int]], mode: str) -> None:
     """Install the Megatron forward schedule matching SkyRL's vLLM loop semantics."""
-    if mode not in {"lora_only", "full_block"}:
+    if mode not in {"lora_only", "base_output_adapter", "full_block"}:
         raise ValueError(f"Unsupported looped LoRA mode: {mode!r}")
 
     from megatron.bridge.peft.lora_layers import LoRALinear, TEFusedLoRALinear
@@ -155,6 +167,21 @@ def install_looped_lora(model: nn.Module | Sequence[nn.Module], sections: Sequen
     schedule = build_looped_lora_schedule(num_hidden_layers, sections)
     if mode == "full_block":
         schedule = tuple(LayerExecution(execution.physical_layer, False) for execution in schedule)
+
+    if mode == "base_output_adapter":
+        repeated_layers = {execution.physical_layer for execution in schedule if execution.lora_only}
+        for layer_index in repeated_layers:
+            layer = physical_layers[layer_index]
+            for module in (layer.self_attention.linear_qkv, layer.mlp.linear_fc1):
+                if isinstance(module, LoRALinear):
+                    module._looped_lora_extra_behavior = _BASE_FEATURE
+            for module_name, module in (
+                ("self_attention.linear_proj", layer.self_attention.linear_proj),
+                ("mlp.linear_fc2", layer.mlp.linear_fc2),
+            ):
+                if not isinstance(module, LoRALinear):
+                    raise ValueError(f"base_output_adapter requires LoRA on decoder layer {layer_index} {module_name}")
+                module._looped_lora_extra_behavior = _OUTPUT_ADAPTER
 
     for module in modules:
         if isinstance(module, TEFusedLoRALinear):

@@ -2,6 +2,7 @@ from types import MethodType
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from skyrl.backends.skyrl_train.patches.megatron import looped_lora
@@ -72,6 +73,59 @@ class _FakeLoraLinear(nn.Module):
     def adapter_forward(self, adapter: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
         return adapter(inputs)
 
+    def base_linear_forward(self, inputs: torch.Tensor):
+        self.base_calls += 1
+        return F.linear(inputs, self.to_wrap.weight), None, inputs
+
+
+class _FactorizedAdapter(nn.Module):
+    def __init__(self, input_size: int, output_size: int, rank: int = 2) -> None:
+        super().__init__()
+        self.linear_in = nn.Linear(input_size, rank, bias=False)
+        self.linear_out = nn.Linear(rank, output_size, bias=False)
+        nn.init.normal_(self.linear_in.weight)
+        nn.init.zeros_(self.linear_out.weight)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.linear_out(self.linear_in(inputs))
+
+
+class _FactorizedLoraLinear(nn.Module):
+    def __init__(self, input_size: int, output_size: int, *, behavior: str = "output_adapter") -> None:
+        super().__init__()
+        self.to_wrap = nn.Linear(input_size, output_size, bias=False)
+        self.to_wrap.weight.requires_grad_(False)
+        self.adapter = _FactorizedAdapter(input_size, output_size)
+        self._adapter_enabled = True
+        self._base_returns_tuple = True
+        self._looped_lora_extra_behavior = behavior
+
+    def _looped_lora_original_forward(self, inputs: torch.Tensor):
+        return self.to_wrap(inputs) + self.adapter(inputs), None
+
+    def base_linear_forward(self, inputs: torch.Tensor):
+        return self.to_wrap(inputs), None, inputs
+
+    def adapter_forward(self, adapter: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+        return adapter(inputs)
+
+
+def _run_base_output_adapter_layer(
+    inputs: torch.Tensor,
+    qkv: _FactorizedLoraLinear,
+    output: _FactorizedLoraLinear,
+    gate_up: _FactorizedLoraLinear,
+    down: _FactorizedLoraLinear,
+) -> torch.Tensor:
+    with _set_context(_adapter_only, True):
+        attention_features, _ = _looped_linear_forward(qkv, inputs)
+        attention_update, _ = _looped_linear_forward(output, torch.tanh(attention_features))
+        hidden_states = inputs + attention_update
+        gate_up_features, _ = _looped_linear_forward(gate_up, hidden_states)
+        gate, up = gate_up_features.chunk(2, dim=-1)
+        mlp_update, _ = _looped_linear_forward(down, F.silu(gate) * up)
+    return hidden_states + mlp_update
+
 
 def test_megatron_extra_pass_skips_frozen_linear_and_backpropagates_through_lora() -> None:
     linear = _FakeLoraLinear(hidden_size=3)
@@ -86,6 +140,108 @@ def test_megatron_extra_pass_skips_frozen_linear_and_backpropagates_through_lora
     assert linear.adapter.weight.grad is not None
     assert linear.to_wrap.weight.grad is None
     assert inputs.grad is not None
+
+
+def test_base_output_adapter_is_identity_at_zero_b_with_first_order_b_gradients() -> None:
+    torch.manual_seed(0)
+    qkv = _FactorizedLoraLinear(4, 4, behavior="base_feature")
+    output = _FactorizedLoraLinear(4, 4, behavior="output_adapter")
+    gate_up = _FactorizedLoraLinear(4, 8, behavior="base_feature")
+    down = _FactorizedLoraLinear(4, 4, behavior="output_adapter")
+    inputs = torch.randn(3, 4, requires_grad=True)
+
+    result = _run_base_output_adapter_layer(inputs, qkv, output, gate_up, down)
+
+    assert torch.equal(result, inputs)
+    result.square().sum().backward()
+    assert output.adapter.linear_out.weight.grad is not None
+    assert output.adapter.linear_out.weight.grad.abs().sum() > 0
+    assert down.adapter.linear_out.weight.grad is not None
+    assert down.adapter.linear_out.weight.grad.abs().sum() > 0
+    assert qkv.adapter.linear_out.weight.grad is None
+    assert gate_up.adapter.linear_out.weight.grad is None
+    assert qkv.to_wrap.weight.grad is None
+    assert gate_up.to_wrap.weight.grad is None
+    assert inputs.grad is not None
+    assert torch.isfinite(inputs.grad).all()
+
+
+def test_base_output_adapter_has_finite_nonlinear_forward_and_backward() -> None:
+    torch.manual_seed(1)
+    qkv = _FactorizedLoraLinear(4, 4, behavior="base_feature")
+    output = _FactorizedLoraLinear(4, 4, behavior="output_adapter")
+    gate_up = _FactorizedLoraLinear(4, 8, behavior="base_feature")
+    down = _FactorizedLoraLinear(4, 4, behavior="output_adapter")
+    with torch.no_grad():
+        output.adapter.linear_out.weight.normal_(std=1e-2)
+        down.adapter.linear_out.weight.normal_(std=1e-2)
+    inputs = torch.randn(3, 4, requires_grad=True)
+
+    result = _run_base_output_adapter_layer(inputs, qkv, output, gate_up, down)
+    result.sum().backward()
+
+    assert not torch.equal(result, inputs)
+    assert torch.isfinite(result).all()
+    for parameter in (*output.parameters(), *down.parameters()):
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all()
+
+
+def test_install_base_output_adapter_routes_repeated_layer_projections(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Attention(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear_qkv = _FactorizedLoraLinear(4, 4)
+            self.linear_proj = _FactorizedLoraLinear(4, 4)
+
+    class _Mlp(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear_fc1 = _FactorizedLoraLinear(4, 8)
+            self.linear_fc2 = _FactorizedLoraLinear(4, 4)
+
+    class _Layer(nn.Module):
+        def __init__(self, layer_number: int) -> None:
+            super().__init__()
+            self.layer_number = layer_number
+            self.self_attention = _Attention()
+            self.mlp = _Mlp()
+
+    class _Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([_Layer(1), _Layer(2)])
+            self.config = type("Config", (), {"num_layers": 2, "enable_mhc_connections": False})()
+            self.num_layers_per_pipeline_rank = 2
+
+        def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+            return inputs
+
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.decoder = _Block()
+
+    class _FakeFusedLora(nn.Module):
+        pass
+
+    import megatron.bridge.peft.lora_layers as lora_layers
+
+    monkeypatch.setattr(lora_layers, "LoRALinear", _FactorizedLoraLinear)
+    monkeypatch.setattr(lora_layers, "TEFusedLoRALinear", _FakeFusedLora)
+    model = _Model()
+
+    looped_lora.install_looped_lora(
+        model,
+        [{"start_layer": 0, "end_layer": 1, "repeat_count": 2}],
+        "base_output_adapter",
+    )
+
+    repeated = model.decoder.layers[0]
+    assert repeated.self_attention.linear_qkv._looped_lora_extra_behavior == "base_feature"
+    assert repeated.mlp.linear_fc1._looped_lora_extra_behavior == "base_feature"
+    assert repeated.self_attention.linear_proj._looped_lora_extra_behavior == "output_adapter"
+    assert repeated.mlp.linear_fc2._looped_lora_extra_behavior == "output_adapter"
 
 
 def test_megatron_extra_pass_repeats_fused_layernorm_sequence_gather(monkeypatch: pytest.MonkeyPatch) -> None:
