@@ -224,8 +224,9 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is not None:
             hidden_states = hidden_states + residual
-        # Fused RMSNorm donates its residual input under torch.compile; keep the
-        # original available for the frozen-base counterfactual below.
+        # Fused RMSNorm donates its residual input under torch.compile. Give
+        # both block evaluations private buffers so the original can remain
+        # the residual stream returned to the next scheduled execution.
         adapted = self._forward_block_path(
             positions,
             hidden_states.clone(),
@@ -234,7 +235,7 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
         )
         base = self._forward_block_path(
             positions,
-            hidden_states,
+            hidden_states.clone(),
             self.looped_base_attn[str(execution_index)],
             base_only=True,
         )
