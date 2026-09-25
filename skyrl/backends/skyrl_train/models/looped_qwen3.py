@@ -113,8 +113,10 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
         lora_only: bool,
         gamma: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_hidden_states = hidden_states
-        input_residual = residual
+        # Fused RMSNorm donates its inputs under torch.compile, so preserve the
+        # pre-block residual stream used by the gated interpolation below.
+        input_hidden_states = hidden_states.clone()
+        input_residual = None if residual is None else residual.clone()
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -307,11 +309,7 @@ class SkyRLLoopedQwen3ForCausalLM(LocalArgmaxMixin, nn.Module, SupportsLoRA):
         )
         if config.tie_word_embeddings:
             tie_weights = getattr(self.lm_head, "tie_weights", None)
-            self.lm_head = (
-                tie_weights(self.model.embed_tokens)
-                if tie_weights is not None
-                else self.model.embed_tokens
-            )
+            self.lm_head = tie_weights(self.model.embed_tokens) if tie_weights is not None else self.model.embed_tokens
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
