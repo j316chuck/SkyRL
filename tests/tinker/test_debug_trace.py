@@ -1,7 +1,13 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlmodel import SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
 
+from skyrl.tinker.api import CreateSessionRequest, create_session
 from skyrl.tinker.debug_trace import (
     debug_trace_enabled,
     fingerprint_models,
@@ -42,3 +48,32 @@ def test_debug_model_registry_scopes_deep_tracing(monkeypatch):
     finally:
         unregister_debug_model("model_traced")
     assert not model_debug_trace_enabled("model_traced")
+
+
+@pytest.mark.asyncio
+async def test_create_session_does_not_read_expired_model_after_commit(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'tinker.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(SQLModel.metadata.create_all)
+    raw_request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                engine_config=SimpleNamespace(base_model="Qwen/Qwen3.6-27B"),
+                debug_trace_contexts={},
+            )
+        )
+    )
+
+    async with AsyncSession(engine, expire_on_commit=True) as session:
+        response = await create_session(
+            CreateSessionRequest(
+                tags=["test"],
+                user_metadata={"debug_trace": "true", "xid": "123"},
+                sdk_version="test",
+            ),
+            raw_request,
+            session,
+        )
+
+    assert raw_request.app.state.debug_trace_contexts[response.session_id]["xid"] == "123"
+    await engine.dispose()

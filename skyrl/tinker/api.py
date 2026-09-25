@@ -957,22 +957,23 @@ async def create_session(
 ):
     """Create a new session + persist in DB"""
     session_id = f"session_{uuid4().hex[:8]}"
+    user_metadata = request.user_metadata or {}
+    enabled = debug_trace_enabled(user_metadata)
+    context = {
+        "xid": user_metadata.get("xid", ""),
+        "session_id": session_id,
+        "runtime_base_model": raw_request.app.state.engine_config.base_model,
+        "sdk_version": request.sdk_version,
+    }
     session_db = SessionDB(
         session_id=session_id,
         tags=request.tags,
-        user_metadata=request.user_metadata or {},
+        user_metadata=user_metadata,
         sdk_version=request.sdk_version,
         status="active",
     )
     session.add(session_db)
     await session.commit()
-    enabled = debug_trace_enabled(session_db.user_metadata)
-    context = {
-        "xid": session_db.user_metadata.get("xid", ""),
-        "session_id": session_id,
-        "runtime_base_model": raw_request.app.state.engine_config.base_model,
-        "sdk_version": request.sdk_version,
-    }
     if enabled:
         raw_request.app.state.debug_trace_contexts[session_id] = context
     log_debug_trace("skyrl.api.session_created", enabled=enabled, **context)
