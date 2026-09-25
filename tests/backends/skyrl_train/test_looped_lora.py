@@ -7,6 +7,9 @@ from torch import nn
 from skyrl.backends.skyrl_train.patches.megatron import looped_lora
 from skyrl.backends.skyrl_train.patches.megatron.looped_lora import (
     _adapter_only,
+    _base_only,
+    _blend_block_delta,
+    _looped_block_delta_layer_forward,
     _looped_block_forward,
     _looped_linear_forward,
     _LoopedModuleList,
@@ -72,6 +75,27 @@ class _FakeLoraLinear(nn.Module):
     def adapter_forward(self, adapter: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
         return adapter(inputs)
 
+    def base_linear_forward(self, inputs: torch.Tensor):
+        output = self.to_wrap.weight @ inputs
+        return output, None, inputs
+
+
+class _CounterfactualLayer(nn.Module):
+    def __init__(self, hidden_size: int, rank: int) -> None:
+        super().__init__()
+        generator = torch.Generator().manual_seed(17)
+        self.base = nn.Parameter(torch.randn(hidden_size, hidden_size, generator=generator), requires_grad=False)
+        self.lora_a = nn.Parameter(torch.randn(rank, hidden_size, generator=generator))
+        self.lora_b = nn.Parameter(torch.zeros(hidden_size, rank))
+        self._looped_lora_original_forward = self.forward
+        self.forward = MethodType(_looped_block_delta_layer_forward, self)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        projected = hidden_states @ self.base.T
+        if not _base_only.get():
+            projected = projected + (hidden_states @ self.lora_a.T) @ self.lora_b.T
+        return torch.tanh(projected)
+
 
 def test_megatron_extra_pass_skips_frozen_linear_and_backpropagates_through_lora() -> None:
     linear = _FakeLoraLinear(hidden_size=3)
@@ -106,6 +130,51 @@ def test_megatron_extra_pass_repeats_fused_layernorm_sequence_gather(monkeypatch
 
     assert output.shape == (4, 3)
     assert gathered_group is linear.adapter.tp_group
+
+
+def test_block_delta_is_identity_at_zero_delta_with_first_order_lora_gradient() -> None:
+    layer = _CounterfactualLayer(hidden_size=4, rank=2)
+    hidden_states = torch.randn(3, 4, generator=torch.Generator().manual_seed(23), requires_grad=True)
+
+    with _set_context(_adapter_only, True):
+        output = layer(hidden_states)
+
+    torch.testing.assert_close(output, hidden_states, rtol=0, atol=0)
+    output.square().sum().backward()
+    assert layer.lora_b.grad is not None
+    assert torch.count_nonzero(layer.lora_b.grad) > 0
+    assert layer.lora_a.grad is not None
+    assert torch.count_nonzero(layer.lora_a.grad) == 0
+    assert hidden_states.grad is not None
+    assert torch.isfinite(hidden_states.grad).all()
+
+
+def test_block_delta_k4_outputs_and_gradients_remain_finite() -> None:
+    layer = _CounterfactualLayer(hidden_size=8, rank=3)
+    with torch.no_grad():
+        layer.lora_b.normal_(std=0.02)
+    hidden_states = torch.randn(5, 8, generator=torch.Generator().manual_seed(29), requires_grad=True)
+
+    for _ in range(3):
+        with _set_context(_adapter_only, True):
+            hidden_states = layer(hidden_states)
+    loss = hidden_states.square().mean()
+    loss.backward()
+
+    assert torch.isfinite(hidden_states).all()
+    assert torch.isfinite(loss)
+    assert layer.lora_a.grad is not None
+    assert layer.lora_b.grad is not None
+    assert torch.isfinite(layer.lora_a.grad).all()
+    assert torch.isfinite(layer.lora_b.grad).all()
+
+
+def test_block_delta_blend_preserves_counterfactual_formula() -> None:
+    hidden_states = torch.tensor([[2.0, -1.0]])
+    adapted = torch.tensor([[7.0, 3.0]])
+    base = torch.tensor([[5.0, 4.0]])
+
+    assert torch.equal(_blend_block_delta(hidden_states, adapted, base), torch.tensor([[4.0, -2.0]]))
 
 
 @pytest.mark.parametrize("repeat_count", [1, 2, 4])

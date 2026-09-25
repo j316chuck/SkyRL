@@ -33,7 +33,37 @@ from tests.backends.skyrl_train.gpu.utils import (
 
 MODEL_NAME = os.environ.get("LOOPED_LORA_MODEL", "Qwen/Qwen3-4B-Thinking-2507")
 REPEAT_COUNT = int(os.environ.get("LOOPED_LORA_K", "4"))
-PROMPTS = ["Hi, my name is", "Hello, I am called", "My name is"]
+HERMES_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_order",
+            "description": "Look up an order by identifier.",
+            "parameters": {
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"],
+            },
+        },
+    },
+]
+HERMES_CONVERSATIONS = [
+    [{"role": "user", "content": "What is the weather in Paris? Use a tool."}],
+    [{"role": "user", "content": "Please look up order A-1042."}],
+    [{"role": "user", "content": "Which available tool can tell me whether order B-7 shipped?"}],
+]
 
 
 def _get_config(num_hidden_layers: int) -> SkyRLTrainConfig:
@@ -64,10 +94,11 @@ def _get_config(num_hidden_layers: int) -> SkyRLTrainConfig:
             "repeat_count": REPEAT_COUNT,
         }
     ]
+    cfg.trainer.policy.model.looped_lora.mode = "block_delta"
     cfg.generator.inference_engine.num_engines = 4
     cfg.generator.inference_engine.tensor_parallel_size = 1
     cfg.generator.inference_engine.distributed_executor_backend = "mp"
-    cfg.generator.inference_engine.max_num_seqs = len(PROMPTS)
+    cfg.generator.inference_engine.max_num_seqs = len(HERMES_CONVERSATIONS)
     cfg.generator.inference_engine.max_num_batched_tokens = 2048
     cfg.generator.inference_engine.engine_init_kwargs = {"max_model_len": 2048}
     validate_cfg(cfg)
@@ -149,7 +180,15 @@ async def test_looped_lora_one_step_roundtrip() -> None:
     cfg = _get_config(hf_config.num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
-    prompt_ids = [tokenizer.encode(prompt, add_special_tokens=False) for prompt in PROMPTS]
+    prompt_ids = [
+        tokenizer.apply_chat_template(
+            conversation,
+            tools=HERMES_TOOLS,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        for conversation in HERMES_CONVERSATIONS
+    ]
 
     with ray_init():
         async with InferenceEngineState.create(
@@ -187,6 +226,8 @@ async def test_looped_lora_one_step_roundtrip() -> None:
             initial_megatron = _score(policy, initial_batch)
             mask = initial_batch["response_mask"].bool()
             initial_vllm_logprobs = initial_batch["rollout_logprobs"]
+            assert torch.isfinite(initial_vllm_logprobs[mask]).all()
+            assert torch.isfinite(initial_megatron[mask]).all()
             initial_diff = (initial_vllm_logprobs[mask] - initial_megatron[mask]).abs().mean().item()
             assert initial_diff < 0.05
 
@@ -195,6 +236,7 @@ async def test_looped_lora_one_step_roundtrip() -> None:
             ray.get(policy.async_run_ray_method("mesh", "forward_backward", data=initial_batch))
             ray.get(policy.async_run_ray_method("pass_through", "optim_step"))
             updated_megatron = _score(policy, initial_batch)
+            assert torch.isfinite(updated_megatron[mask]).all()
             model_movement = (updated_megatron[mask] - initial_megatron[mask]).abs().max().item()
             stale_diff = (initial_vllm_logprobs[mask] - updated_megatron[mask]).abs().mean().item()
             assert model_movement > 1e-4
@@ -220,6 +262,8 @@ async def test_looped_lora_one_step_roundtrip() -> None:
             policy.backload_to_gpu(backload_optimizer=False, backload_model=True)
             synced_megatron = _score(policy, synced_batch)
             synced_mask = synced_batch["response_mask"].bool()
+            assert torch.isfinite(synced_batch["rollout_logprobs"][synced_mask]).all()
+            assert torch.isfinite(synced_megatron[synced_mask]).all()
             synced_diff = (
                 (synced_batch["rollout_logprobs"][synced_mask] - synced_megatron[synced_mask]).abs().mean().item()
             )

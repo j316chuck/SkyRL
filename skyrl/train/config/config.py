@@ -140,8 +140,8 @@ class LoopedLoraConfig(BaseConfig):
     sections: List[Dict[str, int]] = field(default_factory=list)
     """Physical ``[start_layer, end_layer)`` ranges and their total ``repeat_count``."""
 
-    mode: Literal["lora_only", "full_block"] = "lora_only"
-    """Extra-pass compute path. ``full_block`` is a benchmark reference mode."""
+    mode: Literal["lora_only", "full_block", "block_delta"] = "lora_only"
+    """Extra-pass path; ``block_delta`` applies the exact adapted-minus-base block delta."""
 
     def __post_init__(self) -> None:
         from skyrl.train.looped_lora import parse_looped_lora_sections

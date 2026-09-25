@@ -11,6 +11,7 @@ from torch import nn
 from skyrl.train.looped_lora import LayerExecution, build_looped_lora_schedule
 
 _adapter_only: ContextVar[bool] = ContextVar("looped_lora_adapter_only", default=False)
+_base_only: ContextVar[bool] = ContextVar("looped_lora_base_only", default=False)
 _loop_schedule_active: ContextVar[bool] = ContextVar("looped_lora_schedule_active", default=False)
 
 
@@ -70,6 +71,11 @@ def _normalize_adapter_input(linear: nn.Module, inputs: torch.Tensor) -> torch.T
 
 
 def _looped_linear_forward(linear: nn.Module, inputs: torch.Tensor, *args: Any, **kwargs: Any):
+    if _base_only.get():
+        output, bias, _ = linear.base_linear_forward(inputs, *args, **kwargs)
+        if linear._base_returns_tuple:
+            return output, bias
+        return output
     if not _adapter_only.get():
         return linear._looped_lora_original_forward(inputs, *args, **kwargs)
     if not linear._adapter_enabled:
@@ -80,6 +86,38 @@ def _looped_linear_forward(linear: nn.Module, inputs: torch.Tensor, *args: Any, 
     if linear._base_returns_tuple:
         return output, None
     return output
+
+
+def _blend_block_delta(
+    hidden_states: torch.Tensor,
+    adapted_hidden_states: torch.Tensor,
+    base_hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    return hidden_states + (adapted_hidden_states - base_hidden_states)
+
+
+def _looped_block_delta_layer_forward(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    *args: Any,
+    **kwargs: Any,
+):
+    if not _adapter_only.get():
+        return layer._looped_lora_original_forward(hidden_states, *args, **kwargs)
+
+    with _set_context(_adapter_only, False):
+        adapted_output = layer._looped_lora_original_forward(hidden_states, *args, **kwargs)
+    with _set_context(_adapter_only, False), _set_context(_base_only, True):
+        base_output = layer._looped_lora_original_forward(hidden_states, *args, **kwargs)
+
+    if isinstance(adapted_output, tuple):
+        adapted_hidden_states, *other_outputs = adapted_output
+        base_hidden_states = base_output[0]
+        return (
+            _blend_block_delta(hidden_states, adapted_hidden_states, base_hidden_states),
+            *other_outputs,
+        )
+    return _blend_block_delta(hidden_states, adapted_output, base_output)
 
 
 class _LoopedModuleList(nn.ModuleList):
@@ -130,7 +168,7 @@ def _looped_block_forward(block: nn.Module, *args: Any, **kwargs: Any):
 
 def install_looped_lora(model: nn.Module | Sequence[nn.Module], sections: Sequence[dict[str, int]], mode: str) -> None:
     """Install the Megatron forward schedule matching SkyRL's vLLM loop semantics."""
-    if mode not in {"lora_only", "full_block"}:
+    if mode not in {"lora_only", "full_block", "block_delta"}:
         raise ValueError(f"Unsupported looped LoRA mode: {mode!r}")
 
     from megatron.bridge.peft.lora_layers import LoRALinear, TEFusedLoRALinear
@@ -162,6 +200,11 @@ def install_looped_lora(model: nn.Module | Sequence[nn.Module], sections: Sequen
         if isinstance(module, LoRALinear):
             module._looped_lora_original_forward = module.forward
             module.forward = MethodType(_looped_linear_forward, module)
+
+    if mode == "block_delta":
+        for layer in physical_layers:
+            layer._looped_lora_original_forward = layer.forward
+            layer.forward = MethodType(_looped_block_delta_layer_forward, layer)
 
     block.layers = _LoopedModuleList(physical_layers, schedule)
     block._looped_lora_original_forward = block.forward

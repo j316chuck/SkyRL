@@ -48,6 +48,20 @@ def _apply_lora_delta(layer: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
     return layer._apply_lora_to_output(inputs, output)
 
 
+def _apply_base_projection(layer: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+    if not isinstance(layer, BaseLinearLayerWithLoRA):
+        raise RuntimeError("Fast looped LoRA requires vLLM LoRA wrapping")
+
+    output = layer.base_layer(inputs)
+    if isinstance(output, tuple):
+        return output[0]
+    return output
+
+
+def _apply_adapted_projection(layer: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+    return _apply_projection(layer, inputs, lora_only=False)
+
+
 def _apply_projection(
     layer: nn.Module,
     inputs: torch.Tensor,
@@ -65,6 +79,7 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
         self,
         config: Qwen3Config,
         lora_only_execution_indices: tuple[int, ...],
+        block_delta: bool,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
@@ -84,22 +99,29 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
 
         model_prefix = prefix.rsplit(".layers.", 1)[0]
         self.looped_attn = nn.ModuleDict()
+        self.looped_base_attn = nn.ModuleDict()
         for execution_index in lora_only_execution_indices:
-            attention_kwargs = dict(
-                num_kv_heads=self.self_attn.num_kv_heads,
-                cache_config=cache_config,
-                quant_config=quant_config,
-                prefix=f"{model_prefix}.looped_lora_layers.{execution_index}.self_attn.attn",
-                attn_type=AttentionType.DECODER,
-            )
-            if "per_layer_sliding_window" in signature(Attention.__init__).parameters:
-                attention_kwargs["per_layer_sliding_window"] = per_layer_sliding_window
-            self.looped_attn[str(execution_index)] = Attention(
-                self.self_attn.num_heads,
-                self.self_attn.head_dim,
-                self.self_attn.scaling,
-                **attention_kwargs,
-            )
+
+            def make_attention(layer_prefix: str) -> Attention:
+                attention_kwargs = dict(
+                    num_kv_heads=self.self_attn.num_kv_heads,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    prefix=f"{model_prefix}.{layer_prefix}.{execution_index}.self_attn.attn",
+                    attn_type=AttentionType.DECODER,
+                )
+                if "per_layer_sliding_window" in signature(Attention.__init__).parameters:
+                    attention_kwargs["per_layer_sliding_window"] = per_layer_sliding_window
+                return Attention(
+                    self.self_attn.num_heads,
+                    self.self_attn.head_dim,
+                    self.self_attn.scaling,
+                    **attention_kwargs,
+                )
+
+            self.looped_attn[str(execution_index)] = make_attention("looped_lora_layers")
+            if block_delta:
+                self.looped_base_attn[str(execution_index)] = make_attention("looped_lora_base_layers")
 
     def forward_looped(
         self,
@@ -161,6 +183,61 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
         )
         return hidden_states, residual
 
+    def _forward_block_path(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attention: Attention,
+        base_only: bool,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        projection = _apply_base_projection if base_only else _apply_adapted_projection
+
+        qkv = projection(self.self_attn.qkv_proj, hidden_states)
+        q, k, v = qkv.split(
+            [self.self_attn.q_size, self.self_attn.kv_size, self.self_attn.kv_size],
+            dim=-1,
+        )
+        q = self.self_attn.q_norm(
+            q.view(*q.shape[:-1], q.shape[-1] // self.self_attn.head_dim, self.self_attn.head_dim)
+        ).view(q.shape)
+        k = self.self_attn.k_norm(
+            k.view(*k.shape[:-1], k.shape[-1] // self.self_attn.head_dim, self.self_attn.head_dim)
+        ).view(k.shape)
+        q, k = self.self_attn.rotary_emb(positions, q, k)
+        hidden_states = attention(q, k, v)
+        hidden_states = projection(self.self_attn.o_proj, hidden_states)
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = projection(self.mlp.gate_up_proj, hidden_states)
+        hidden_states = self.mlp.act_fn(hidden_states)
+        hidden_states = projection(self.mlp.down_proj, hidden_states)
+        return hidden_states + residual
+
+    def forward_block_delta(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        execution_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is not None:
+            hidden_states = hidden_states + residual
+        adapted = self._forward_block_path(
+            positions,
+            hidden_states,
+            self.looped_attn[str(execution_index)],
+            base_only=False,
+        )
+        base = self._forward_block_path(
+            positions,
+            hidden_states,
+            self.looped_base_attn[str(execution_index)],
+            base_only=True,
+        )
+        return adapted - base, hidden_states
+
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -188,9 +265,9 @@ class LoopedLoraQwen3Model(Qwen2Model):
         if not sections:
             raise ValueError("Fast looped LoRA requires at least one configured section")
         self.looped_lora_mode = getattr(config, "looped_lora_mode", "lora_only")
-        if self.looped_lora_mode not in {"lora_only", "full_block"}:
+        if self.looped_lora_mode not in {"lora_only", "full_block", "block_delta"}:
             raise ValueError(
-                "Fast looped LoRA mode must be 'lora_only' or 'full_block', "
+                "Fast looped LoRA mode must be 'lora_only', 'full_block', or 'block_delta', "
                 f"got {self.looped_lora_mode!r}"
             )
         schedule = build_looped_lora_schedule(config.num_hidden_layers, sections)
@@ -207,6 +284,7 @@ class LoopedLoraQwen3Model(Qwen2Model):
             return LoopedLoraQwen3DecoderLayer(
                 config=config,
                 lora_only_execution_indices=lora_only_by_physical_layer[physical_layer],
+                block_delta=self.looped_lora_mode == "block_delta",
                 cache_config=cache_config,
                 quant_config=quant_config,
                 prefix=prefix,
@@ -246,13 +324,21 @@ class LoopedLoraQwen3Model(Qwen2Model):
         for execution_index, execution in enumerate(self.looped_lora_schedule):
             layer = self.layers[execution.physical_layer]
             if execution.lora_only:
-                hidden_states, residual = layer.forward_looped(
-                    positions,
-                    hidden_states,
-                    residual,
-                    execution_index,
-                    lora_only=self.looped_lora_mode == "lora_only",
-                )
+                if self.looped_lora_mode == "block_delta":
+                    hidden_states, residual = layer.forward_block_delta(
+                        positions,
+                        hidden_states,
+                        residual,
+                        execution_index,
+                    )
+                else:
+                    hidden_states, residual = layer.forward_looped(
+                        positions,
+                        hidden_states,
+                        residual,
+                        execution_index,
+                        lora_only=self.looped_lora_mode == "lora_only",
+                    )
             else:
                 hidden_states, residual = layer(positions, hidden_states, residual)
 
@@ -293,11 +379,7 @@ class SkyRLLoopedQwen3ForCausalLM(LocalArgmaxMixin, nn.Module, SupportsLoRA):
         )
         if config.tie_word_embeddings:
             tie_weights = getattr(self.lm_head, "tie_weights", None)
-            self.lm_head = (
-                tie_weights(self.model.embed_tokens)
-                if tie_weights is not None
-                else self.model.embed_tokens
-            )
+            self.lm_head = tie_weights(self.model.embed_tokens) if tie_weights is not None else self.model.embed_tokens
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
