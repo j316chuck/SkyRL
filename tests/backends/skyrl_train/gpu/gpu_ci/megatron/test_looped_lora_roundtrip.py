@@ -66,6 +66,21 @@ HERMES_CONVERSATIONS = [
 ]
 
 
+def _build_hermes_prompt_ids(tokenizer) -> list[list[int]]:
+    prompt_ids = []
+    for conversation in HERMES_CONVERSATIONS:
+        prompt = tokenizer.apply_chat_template(
+            conversation,
+            tools=HERMES_TOOLS,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        assert "<tools>" in prompt
+        prompt_ids.append(tokenizer.encode(prompt, add_special_tokens=False))
+    return prompt_ids
+
+
 def _get_config(num_hidden_layers: int) -> SkyRLTrainConfig:
     cfg = SkyRLTrainConfig()
     cfg.trainer.strategy = "megatron"
@@ -180,15 +195,7 @@ async def test_looped_lora_one_step_roundtrip() -> None:
     cfg = _get_config(hf_config.num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
-    prompt_ids = [
-        tokenizer.apply_chat_template(
-            conversation,
-            tools=HERMES_TOOLS,
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-        for conversation in HERMES_CONVERSATIONS
-    ]
+    prompt_ids = _build_hermes_prompt_ids(tokenizer)
 
     with ray_init():
         async with InferenceEngineState.create(
