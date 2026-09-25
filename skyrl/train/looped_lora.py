@@ -1,6 +1,10 @@
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+import torch
+
+SUPPORTED_LOOPED_LORA_MODES = frozenset({"lora_only", "full_block", "gated_full_block"})
+
 
 @dataclass(frozen=True)
 class LoopedLoraSection:
@@ -13,6 +17,34 @@ class LoopedLoraSection:
 class LayerExecution:
     physical_layer: int
     lora_only: bool
+
+
+def validate_looped_lora_config(mode: str, gamma: float) -> None:
+    if mode not in SUPPORTED_LOOPED_LORA_MODES:
+        raise ValueError(f"Unsupported looped LoRA mode: {mode!r}")
+    if not 0.0 < gamma <= 1.0:
+        raise ValueError(f"Looped LoRA gamma must be in (0, 1], got {gamma!r}")
+
+
+def blend_hidden_states(
+    input_hidden_states: torch.Tensor,
+    output_hidden_states: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    """Blend a recurrent block output with the block input."""
+    return torch.lerp(input_hidden_states, output_hidden_states, gamma)
+
+
+def blend_qwen_residual_stream(
+    input_hidden_states: torch.Tensor,
+    input_residual: torch.Tensor | None,
+    output_hidden_states: torch.Tensor,
+    output_residual: torch.Tensor,
+    gamma: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Blend a Qwen block while retaining vLLM's fused residual representation."""
+    input_stream = input_hidden_states if input_residual is None else input_hidden_states + input_residual
+    return output_hidden_states * gamma, torch.lerp(input_stream, output_residual, gamma)
 
 
 def parse_looped_lora_sections(

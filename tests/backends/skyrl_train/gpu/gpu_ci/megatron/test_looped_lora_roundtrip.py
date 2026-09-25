@@ -33,7 +33,57 @@ from tests.backends.skyrl_train.gpu.utils import (
 
 MODEL_NAME = os.environ.get("LOOPED_LORA_MODEL", "Qwen/Qwen3-4B-Thinking-2507")
 REPEAT_COUNT = int(os.environ.get("LOOPED_LORA_K", "4"))
-PROMPTS = ["Hi, my name is", "Hello, I am called", "My name is"]
+LOOPED_LORA_MODE = os.environ.get("LOOPED_LORA_MODE", "gated_full_block")
+LOOPED_LORA_GAMMA = float(os.environ.get("LOOPED_LORA_GAMMA", "0.25"))
+HERMES_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_order",
+            "description": "Look up an order by identifier.",
+            "parameters": {
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"],
+            },
+        },
+    },
+]
+HERMES_CONVERSATIONS = [
+    [
+        {
+            "role": "system",
+            "content": "Use a tool when it is needed to answer accurately.",
+        },
+        {"role": "user", "content": "What is the current weather in Paris?"},
+    ],
+    [
+        {
+            "role": "system",
+            "content": "Call the supplied function instead of guessing.",
+        },
+        {"role": "user", "content": "Please check order A-1042."},
+    ],
+    [
+        {
+            "role": "system",
+            "content": "Tools are optional; answer directly when no tool applies.",
+        },
+        {"role": "user", "content": "Explain in one sentence why the sky looks blue."},
+    ],
+]
 
 
 def _get_config(num_hidden_layers: int) -> SkyRLTrainConfig:
@@ -64,10 +114,12 @@ def _get_config(num_hidden_layers: int) -> SkyRLTrainConfig:
             "repeat_count": REPEAT_COUNT,
         }
     ]
+    cfg.trainer.policy.model.looped_lora.mode = LOOPED_LORA_MODE
+    cfg.trainer.policy.model.looped_lora.gamma = LOOPED_LORA_GAMMA
     cfg.generator.inference_engine.num_engines = 4
     cfg.generator.inference_engine.tensor_parallel_size = 1
     cfg.generator.inference_engine.distributed_executor_backend = "mp"
-    cfg.generator.inference_engine.max_num_seqs = len(PROMPTS)
+    cfg.generator.inference_engine.max_num_seqs = len(HERMES_CONVERSATIONS)
     cfg.generator.inference_engine.max_num_batched_tokens = 2048
     cfg.generator.inference_engine.engine_init_kwargs = {"max_model_len": 2048}
     validate_cfg(cfg)
@@ -114,6 +166,30 @@ def _score(policy, batch: TrainingInputBatch) -> torch.Tensor:
     return loss_fn_outputs_to_tensor(output.loss_fn_outputs, key="logprobs")
 
 
+def _build_hermes_prompt_ids(tokenizer) -> list[list[int]]:
+    prompt_ids = []
+    for messages in HERMES_CONVERSATIONS:
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tools=HERMES_TOOLS,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        assert "<tools>" in prompt
+        prompt_ids.append(tokenizer.encode(prompt, add_special_tokens=False))
+    return prompt_ids
+
+
+def _get_logprob_mae(vllm_logprobs: torch.Tensor, trainer_logprobs: torch.Tensor, mask: torch.Tensor) -> float:
+    selected_vllm = vllm_logprobs[mask]
+    selected_trainer = trainer_logprobs[mask]
+    assert selected_vllm.numel() > 0
+    assert torch.isfinite(selected_vllm).all()
+    assert torch.isfinite(selected_trainer).all()
+    return (selected_vllm - selected_trainer).abs().mean().item()
+
+
 async def _generate(client, prompt_ids, cfg: SkyRLTrainConfig):
     sampling_params = get_sampling_params_for_backend(
         "vllm",
@@ -145,11 +221,13 @@ async def _sync(policy, client, cfg: SkyRLTrainConfig) -> None:
 @pytest.mark.h100
 async def test_looped_lora_one_step_roundtrip() -> None:
     assert REPEAT_COUNT in {1, 2, 4, 8}
+    assert LOOPED_LORA_MODE == "gated_full_block"
+    assert LOOPED_LORA_GAMMA == 0.25
     hf_config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
     cfg = _get_config(hf_config.num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
-    prompt_ids = [tokenizer.encode(prompt, add_special_tokens=False) for prompt in PROMPTS]
+    prompt_ids = _build_hermes_prompt_ids(tokenizer)
 
     with ray_init():
         async with InferenceEngineState.create(
@@ -187,7 +265,7 @@ async def test_looped_lora_one_step_roundtrip() -> None:
             initial_megatron = _score(policy, initial_batch)
             mask = initial_batch["response_mask"].bool()
             initial_vllm_logprobs = initial_batch["rollout_logprobs"]
-            initial_diff = (initial_vllm_logprobs[mask] - initial_megatron[mask]).abs().mean().item()
+            initial_diff = _get_logprob_mae(initial_vllm_logprobs, initial_megatron, mask)
             assert initial_diff < 0.05
 
             generator = torch.Generator().manual_seed(0)
@@ -195,6 +273,7 @@ async def test_looped_lora_one_step_roundtrip() -> None:
             ray.get(policy.async_run_ray_method("mesh", "forward_backward", data=initial_batch))
             ray.get(policy.async_run_ray_method("pass_through", "optim_step"))
             updated_megatron = _score(policy, initial_batch)
+            assert torch.isfinite(updated_megatron[mask]).all()
             model_movement = (updated_megatron[mask] - initial_megatron[mask]).abs().max().item()
             stale_diff = (initial_vllm_logprobs[mask] - updated_megatron[mask]).abs().mean().item()
             assert model_movement > 1e-4
@@ -220,9 +299,7 @@ async def test_looped_lora_one_step_roundtrip() -> None:
             policy.backload_to_gpu(backload_optimizer=False, backload_model=True)
             synced_megatron = _score(policy, synced_batch)
             synced_mask = synced_batch["response_mask"].bool()
-            synced_diff = (
-                (synced_batch["rollout_logprobs"][synced_mask] - synced_megatron[synced_mask]).abs().mean().item()
-            )
+            synced_diff = _get_logprob_mae(synced_batch["rollout_logprobs"], synced_megatron, synced_mask)
 
             print(
                 f"K={REPEAT_COUNT}: initial={initial_diff:.6f}, stale={stale_diff:.6f}, "

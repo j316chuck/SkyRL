@@ -503,6 +503,7 @@ class MegatronWorker:
                     model,
                     looped_lora_config["sections"],
                     looped_lora_config["mode"],
+                    looped_lora_config["gamma"],
                 )
                 return model
 

@@ -278,10 +278,12 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         hf_overrides["architectures"] = architecture
         hf_overrides["looped_lora_sections"] = looped_lora_sections
         hf_overrides["looped_lora_mode"] = looped_lora_config["mode"]
+        hf_overrides["looped_lora_gamma"] = looped_lora_config["gamma"]
         engine_kwargs["hf_overrides"] = hf_overrides
         logger.info(
-            "vLLM looped LoRA enabled: mode=%s sections=%s",
+            "vLLM looped LoRA enabled: mode=%s gamma=%s sections=%s",
             looped_lora_config["mode"],
+            looped_lora_config["gamma"],
             looped_lora_sections,
         )
 

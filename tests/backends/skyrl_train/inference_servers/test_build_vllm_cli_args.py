@@ -155,6 +155,22 @@ def test_build_vllm_cli_args_succeeds_on_gpu_less_host(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_build_vllm_cli_args_propagates_gated_full_block_gamma():
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.model.lora.rank = 16
+    cfg.trainer.policy.megatron_config.lora_config.merge_lora = False
+    cfg.trainer.policy.model.looped_lora.sections = [{"start_layer": 14, "end_layer": 22, "repeat_count": 4}]
+    cfg.trainer.policy.model.looped_lora.mode = "gated_full_block"
+    cfg.trainer.policy.model.looped_lora.gamma = 0.25
+
+    args = build_vllm_cli_args(cfg)
+
+    assert args.hf_overrides["looped_lora_mode"] == "gated_full_block"
+    assert args.hf_overrides["looped_lora_gamma"] == 0.25
+
+
+@pytest.mark.vllm
 def test_sample_support_uses_processed_top_k_logprobs():
     cfg = SkyRLTrainConfig.from_cli_overrides(
         [

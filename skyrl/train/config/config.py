@@ -140,13 +140,20 @@ class LoopedLoraConfig(BaseConfig):
     sections: List[Dict[str, int]] = field(default_factory=list)
     """Physical ``[start_layer, end_layer)`` ranges and their total ``repeat_count``."""
 
-    mode: Literal["lora_only", "full_block"] = "lora_only"
-    """Extra-pass compute path. ``full_block`` is a benchmark reference mode."""
+    mode: Literal["lora_only", "full_block", "gated_full_block"] = "lora_only"
+    """Extra-pass compute path. ``gated_full_block`` uses a damped nonlinear block recurrence."""
+
+    gamma: float = 0.25
+    """Fixed interpolation weight for each ``gated_full_block`` extra pass."""
 
     def __post_init__(self) -> None:
-        from skyrl.train.looped_lora import parse_looped_lora_sections
+        from skyrl.train.looped_lora import (
+            parse_looped_lora_sections,
+            validate_looped_lora_config,
+        )
 
         parse_looped_lora_sections(self.sections)
+        validate_looped_lora_config(self.mode, self.gamma)
 
 
 @dataclass

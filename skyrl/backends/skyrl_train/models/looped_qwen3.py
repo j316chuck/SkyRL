@@ -26,8 +26,10 @@ from vllm.v1.attention.backend import AttentionType
 
 from skyrl.train.looped_lora import (
     LayerExecution,
+    blend_qwen_residual_stream,
     build_looped_lora_schedule,
     get_lora_only_executions_by_physical_layer,
+    validate_looped_lora_config,
 )
 
 logger = init_logger(__name__)
@@ -109,7 +111,10 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
         execution_index: int,
         *,
         lora_only: bool,
+        gamma: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_hidden_states = hidden_states
+        input_residual = residual
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -159,6 +164,14 @@ class LoopedLoraQwen3DecoderLayer(Qwen3DecoderLayer):
             hidden_states,
             lora_only=lora_only,
         )
+        if gamma is not None:
+            hidden_states, residual = blend_qwen_residual_stream(
+                input_hidden_states,
+                input_residual,
+                hidden_states,
+                residual,
+                gamma,
+            )
         return hidden_states, residual
 
 
@@ -188,11 +201,11 @@ class LoopedLoraQwen3Model(Qwen2Model):
         if not sections:
             raise ValueError("Fast looped LoRA requires at least one configured section")
         self.looped_lora_mode = getattr(config, "looped_lora_mode", "lora_only")
-        if self.looped_lora_mode not in {"lora_only", "full_block"}:
-            raise ValueError(
-                "Fast looped LoRA mode must be 'lora_only' or 'full_block', "
-                f"got {self.looped_lora_mode!r}"
-            )
+        configured_gamma = getattr(config, "looped_lora_gamma", None)
+        if self.looped_lora_mode == "gated_full_block" and configured_gamma is None:
+            raise ValueError("Fast looped LoRA gated_full_block mode requires looped_lora_gamma")
+        self.looped_lora_gamma = 0.25 if configured_gamma is None else configured_gamma
+        validate_looped_lora_config(self.looped_lora_mode, self.looped_lora_gamma)
         schedule = build_looped_lora_schedule(config.num_hidden_layers, sections)
         lora_only_by_physical_layer = get_lora_only_executions_by_physical_layer(config.num_hidden_layers, schedule)
 
@@ -252,6 +265,7 @@ class LoopedLoraQwen3Model(Qwen2Model):
                     residual,
                     execution_index,
                     lora_only=self.looped_lora_mode == "lora_only",
+                    gamma=(self.looped_lora_gamma if self.looped_lora_mode == "gated_full_block" else None),
                 )
             else:
                 hidden_states, residual = layer(positions, hidden_states, residual)

@@ -7,13 +7,19 @@ from torch import nn
 from skyrl.backends.skyrl_train.patches.megatron import looped_lora
 from skyrl.backends.skyrl_train.patches.megatron.looped_lora import (
     _adapter_only,
+    _loop_gamma,
+    _loop_schedule_active,
     _looped_block_forward,
+    _looped_layer_forward,
     _looped_linear_forward,
     _LoopedModuleList,
     _set_context,
 )
+from skyrl.train.config import LoopedLoraConfig
 from skyrl.train.looped_lora import (
     LayerExecution,
+    blend_hidden_states,
+    blend_qwen_residual_stream,
     build_looped_lora_schedule,
     get_lora_only_executions_by_physical_layer,
 )
@@ -73,6 +79,11 @@ class _FakeLoraLinear(nn.Module):
         return adapter(inputs)
 
 
+class _FakeTransformerLayer(nn.Module):
+    def _looped_lora_original_forward(self, hidden_states: torch.Tensor):
+        return hidden_states.square() + 1.0, None
+
+
 def test_megatron_extra_pass_skips_frozen_linear_and_backpropagates_through_lora() -> None:
     linear = _FakeLoraLinear(hidden_size=3)
     inputs = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
@@ -106,6 +117,82 @@ def test_megatron_extra_pass_repeats_fused_layernorm_sequence_gather(monkeypatch
 
     assert output.shape == (4, 3)
     assert gathered_group is linear.adapter.tp_group
+
+
+def test_gated_full_block_formula_has_finite_nonzero_gradients() -> None:
+    inputs = torch.tensor([-0.5, 0.25, 2.0], requires_grad=True)
+    layer = _FakeTransformerLayer()
+
+    with _set_context(_loop_gamma, 0.25):
+        output, context = _looped_layer_forward(layer, inputs)
+    output.sum().backward()
+
+    expected = 0.75 * inputs.detach() + 0.25 * (inputs.detach().square() + 1.0)
+    torch.testing.assert_close(output.detach(), expected)
+    assert context is None
+    assert inputs.grad is not None
+    assert torch.isfinite(inputs.grad).all()
+    torch.testing.assert_close(inputs.grad, 0.75 + 0.5 * inputs.detach())
+
+
+def test_vllm_residual_blend_matches_gated_full_block_formula() -> None:
+    input_hidden = torch.tensor([1.0, -2.0], requires_grad=True)
+    input_residual = torch.tensor([0.5, 4.0], requires_grad=True)
+    output_hidden = torch.tensor([3.0, 2.0], requires_grad=True)
+    output_residual = torch.tensor([-1.0, 5.0], requires_grad=True)
+
+    blended_hidden, blended_residual = blend_qwen_residual_stream(
+        input_hidden,
+        input_residual,
+        output_hidden,
+        output_residual,
+        0.25,
+    )
+    blended_stream = blended_hidden + blended_residual
+    expected = 0.75 * (input_hidden + input_residual) + 0.25 * (output_hidden + output_residual)
+    torch.testing.assert_close(blended_stream, expected)
+
+    blended_stream.sum().backward()
+    for value in (input_hidden, input_residual, output_hidden, output_residual):
+        assert value.grad is not None
+        assert torch.isfinite(value.grad).all()
+
+
+@pytest.mark.parametrize("repeat_count", [1, 4])
+def test_gated_full_block_applies_gamma_only_to_extra_executions(repeat_count: int) -> None:
+    schedule = build_looped_lora_schedule(
+        3,
+        [{"start_layer": 1, "end_layer": 2, "repeat_count": repeat_count}],
+    )
+    layers = [nn.Identity() for _ in range(3)]
+    looped_layers = _LoopedModuleList(layers, schedule, mode="gated_full_block", gamma=0.25)
+
+    with _set_context(_loop_schedule_active, True):
+        observed_gammas = []
+        for layer in looped_layers:
+            observed_gammas.append(_loop_gamma.get())
+            layer(torch.ones(1))
+
+    assert observed_gammas == [None, None] + [0.25] * (repeat_count - 1) + [None]
+
+
+def test_blend_hidden_states_is_identity_at_zero_and_full_block_at_one() -> None:
+    inputs = torch.tensor([1.0, 2.0])
+    outputs = torch.tensor([4.0, -2.0])
+
+    torch.testing.assert_close(blend_hidden_states(inputs, outputs, 0.0), inputs)
+    torch.testing.assert_close(blend_hidden_states(inputs, outputs, 1.0), outputs)
+
+
+@pytest.mark.parametrize("gamma", [0.0, -0.1, 1.1, float("nan")])
+def test_gated_full_block_rejects_invalid_gamma(gamma: float) -> None:
+    with pytest.raises(ValueError, match="gamma must be in"):
+        LoopedLoraConfig(mode="gated_full_block", gamma=gamma)
+
+
+def test_looped_lora_rejects_unknown_mode() -> None:
+    with pytest.raises(ValueError, match="Unsupported looped LoRA mode"):
+        LoopedLoraConfig(mode="renamed_full_block")
 
 
 @pytest.mark.parametrize("repeat_count", [1, 2, 4])
