@@ -11,6 +11,10 @@ from jaxtyping import Float, Integer
 from pytest import approx
 
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_DTYPE,
+    SAMPLE_SUPPORT_PADDING,
+)
 from skyrl.backends.skyrl_train.workers.worker import CriticWorkerBase, PolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.worker_utils import BatchIterator
 from skyrl.train.config import SkyRLTrainConfig
@@ -81,10 +85,10 @@ def _get_test_data(trainer: RayPPOTrainer):
     action_log_probs: Float[torch.Tensor, "batch_size total_seq_len"] = torch.log(
         torch.tensor([[0.1, 0.3, 0.2, 0.2, 0.2], [0.3, 0.3, 0.2, 0.1, 0.1]])
     )
-    action_masks: Integer[torch.Tensor, "batch_size total_seq_len"] = torch.stack(
+    response_masks: Integer[torch.Tensor, "batch_size total_seq_len"] = torch.stack(
         [torch.tensor([1, 1, 1, 0, 0], dtype=torch.int32), torch.tensor([1, 1, 1, 1, 1], dtype=torch.int32)], dim=0
     )
-    actual_response_lengths: Float[torch.Tensor, "batch_size"] = action_masks.sum(dim=-1).to(float)
+    actual_response_lengths: Float[torch.Tensor, "batch_size"] = response_masks.sum(dim=-1).to(float)
     rewards_all: Float[torch.Tensor, "batch_size total_seq_len"] = torch.stack(
         [torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0]), torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0])], dim=0
     )
@@ -99,7 +103,7 @@ def _get_test_data(trainer: RayPPOTrainer):
             "loss_mask": ret_loss_masks,
             "base_action_log_probs": base_log_probs,
             "action_log_probs": action_log_probs,
-            "response_mask": action_masks,
+            "response_mask": response_masks,
             "rewards": rewards_all,
             "values": values,
         },
@@ -112,6 +116,37 @@ def _get_test_data(trainer: RayPPOTrainer):
     data = trainer.apply_reward_kl_penalty(data)
 
     return data
+
+
+def test_convert_to_training_input_records_sample_support_metrics(dummy_config, dummy_tokenizer, dummy_generator):
+    dummy_config.trainer.policy_mini_batch_size = 2
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=dummy_tokenizer,
+        train_dataset=DummyDataset(),
+        eval_dataset=None,
+        inference_engine_client=None,
+        generator=dummy_generator,
+    )
+    trainer.dispatch = MagicMock()
+    trainer.dispatch.get_lcm_dp_size.return_value = 1
+    padding_row = [SAMPLE_SUPPORT_PADDING] * 4
+    generator_output = {
+        "prompt_token_ids": [[1, 2], [3]],
+        "response_ids": [[4, 5, 6], [7, 8]],
+        "rewards": [[0.0, 0.0, 1.0], [0.0, 1.0]],
+        "loss_masks": [[1, 1, 0], [1, 1]],
+        "rollout_sample_support": [
+            np.array([[4, 14, -1, -1], [5, 15, 25, 35], padding_row], dtype=SAMPLE_SUPPORT_DTYPE),
+            np.array([[7, -1, -1, -1], [8, 18, 28, -1]], dtype=SAMPLE_SUPPORT_DTYPE),
+        ],
+    }
+
+    trainer.convert_to_training_input(generator_output, ["uid1", "uid2"])
+
+    assert trainer.all_metrics["generate/sample_support_size_mean"] == 2.5
+    assert trainer.all_metrics["generate/sample_support_full_fraction"] == 0.25
 
 
 def test_calculate_kl_create_experience_batched(dummy_config):
@@ -599,7 +634,9 @@ def test_forward_backward_batch_calculations():
     # Mock _forward_backward_micro to track calls
     policy_forward_backward_micro_calls = []
 
-    def mock_policy_forward_backward_micro(experience, microbatch_weight, loss_fn=None, loss_fn_config=None):
+    def mock_policy_forward_backward_micro(
+        experience, microbatch_weight, loss_fn=None, loss_fn_config=None, return_per_token_outputs=True
+    ):
         policy_forward_backward_micro_calls.append(experience)
         return {"policy_loss": 0.5, "ppo_clip_ratio": 0.1, "policy_entropy": 2.0, "response_length": response_length}
 

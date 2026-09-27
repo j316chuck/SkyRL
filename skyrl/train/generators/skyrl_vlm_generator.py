@@ -21,7 +21,12 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
     RemoteInferenceClient,
 )
 from skyrl.train.config import GeneratorConfig, SkyRLGymConfig
-from skyrl.train.generators.base import GeneratorOutput, TrajectoryID
+from skyrl.train.generators.base import (
+    TRAINING_PHASE_TRAIN,
+    GeneratorOutput,
+    TrainingPhase,
+    TrajectoryID,
+)
 from skyrl.train.generators.skyrl_gym_generator import (
     SkyRLGymGenerator,
     TrajectoryOutput,
@@ -57,6 +62,7 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
                 "SkyRLVLMGymGenerator requires `use_conversation_multi_turn=True` "
                 "because multi-modal observations must be in separate user messages."
             )
+        super()._validate_cfg(generator_cfg)
 
     async def _render_conversation(self, conversation: ConversationType) -> RenderedConversation:
         rendered = await self.inference_engine_client.render_chat_completion(
@@ -73,6 +79,8 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
         max_input_length: int,
         sampling_params: Optional[Dict[str, Any]] = None,
         trajectory_id: Optional[TrajectoryID] = None,
+        cache_salt: Optional[str] = None,
+        training_phase: TrainingPhase = TRAINING_PHASE_TRAIN,
     ) -> TrajectoryOutput:
         """Multi-turn VLM generation loop for a single trajectory.
         The conversation is treated as the source of truth and re-tokenized each step.
@@ -106,7 +114,7 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
             current_sampling_params: dict = (
                 sampling_params if sampling_params is not None else asdict(self.generator_cfg.sampling_params)
             )
-            get_logprobs = self.generator_cfg.sampling_params.logprobs is not None
+            get_logprobs = current_sampling_params.get("logprobs", None) is not None
             stop_strs = current_sampling_params.get("stop", None)
 
             # ── Accumulators ───────────────────────────────────────────────
@@ -154,6 +162,7 @@ class SkyRLVLMGymGenerator(SkyRLGymGenerator):
                     session_ids=[session_id],
                     sampling_params=current_sampling_params,
                     mm_features=[latest_features] if latest_features is not None else None,
+                    cache_salt=cache_salt,
                 )
                 engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
 
