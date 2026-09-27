@@ -23,8 +23,18 @@ def _make_collator(
     pp: int = 1,
     cp: int = 1,
     max_tokens_per_microbatch: int | None = None,
+    fp8: object = None,
 ) -> PackedDataCollator:
     """Build a PackedDataCollator from config (no Ray, no workers)."""
+    megatron_config = MegatronConfig(
+        tensor_model_parallel_size=tp,
+        pipeline_model_parallel_size=pp,
+        context_parallel_size=cp,
+        expert_model_parallel_size=1,
+    )
+    if fp8 is not None:
+        megatron_config.transformer_config_kwargs["fp8"] = fp8
+
     cfg = SFTConfig(
         strategy="megatron",
         max_length=max_length,
@@ -34,12 +44,7 @@ def _make_collator(
         use_sequence_packing=True,
         max_tokens_per_microbatch=max_tokens_per_microbatch,
         placement=SFTPlacementConfig(num_nodes=1, num_gpus_per_node=num_gpus),
-        megatron_config=MegatronConfig(
-            tensor_model_parallel_size=tp,
-            pipeline_model_parallel_size=pp,
-            context_parallel_size=cp,
-            expert_model_parallel_size=1,
-        ),
+        megatron_config=megatron_config,
     )
     # Avoid SFTTrainer.__init__ kicking off bridge config build by injecting
     # a fake skyrl_cfg.
@@ -201,32 +206,88 @@ class TestPackingCollator:
             _make_example(5, 3),  # 5 tokens -> rounded to 8
         ]
         batch = collator(examples, batch_size=2)
-        # Row width >= 16 (two sub-seqs each padded to 8).
-        assert batch["sequences"].shape[1] >= 16
+        # BF16/layout-only path: two sub-seqs each padded to 8.
+        assert batch["sequences"].shape[1] == 16
         # Both seqs are in the same row.
         subseq_lengths = batch["sub_seq_lengths"][0].tolist()
         assert sum(subseq_lengths) == 12  # raw, un-padded
 
-    def test_cp_alignment_pads_each_sub_seq(self):
-        """With cp_size > 1, each sub-seq's footprint is rounded up to a
-        multiple of ``tp_size * cp_size * 2`` (must match the worker's
-        preprocess_packed_seqs align_size)."""
-        # tp=1, cp=2 -> align_size = 1*2*2 = 4. Use 2 GPUs -> dp=1.
+    def test_fp8_tp_alignment_cost_prevents_overpacking(self):
+        """Packing uses each sequence's aligned FP8/TP footprint."""
+        collator = _make_collator(num_gpus=4, batch_size=2, max_length=128, tp=4, fp8="hybrid")
+        examples = [
+            _make_example(7, 3),
+            _make_example(5, 3),
+        ]
+        batch = collator(examples, batch_size=2)
+        # TP4 gives each sequence a 512-token footprint, so the 128-token budget
+        # expands to one footprint without packing both sequences together.
+        assert batch["sequences"].shape == (2, 512)
+        assert sorted(lengths.tolist() for lengths in batch["sub_seq_lengths"]) == [[5], [7]]
+
+    def test_bf16_cp_alignment_does_not_apply_fp8_padding(self):
+        """With CP>1 and BF16, keep only TP/CP layout padding."""
         collator = _make_collator(num_gpus=2, batch_size=2, max_length=128, cp=2)
         examples = [
             _make_example(6, 3),  # 6 tokens -> rounded up to 8
             _make_example(5, 3),  # 5 tokens -> rounded up to 8
         ]
         batch = collator(examples, batch_size=2)
-        # Both sub-seqs in one row (dp=1), each padded to 8 -> row width >= 16.
-        assert batch["sequences"].shape[1] >= 16
+        assert batch["sequences"].shape[1] == 16
+        subseq_lengths = batch["sub_seq_lengths"][0].tolist()
+        assert sorted(subseq_lengths) == [5, 6]
+
+    def test_fp8_cp_alignment_pads_each_sub_seq(self):
+        """With cp_size > 1, each sub-seq's footprint is rounded up to a
+        multiple that leaves each CP rank's local shard 16-aligned."""
+        # tp=1, cp=2 -> align_size = lcm(1*2*2, 16*2) = 32.
+        collator = _make_collator(num_gpus=2, batch_size=2, max_length=128, cp=2, fp8="hybrid")
+        examples = [
+            _make_example(6, 3),  # 6 tokens -> rounded up to 32
+            _make_example(5, 3),  # 5 tokens -> rounded up to 32
+        ]
+        batch = collator(examples, batch_size=2)
+        # Both sub-seqs in one row (dp=1), each padded to 32 -> row width >= 64.
+        assert batch["sequences"].shape[1] >= 64
         subseq_lengths = batch["sub_seq_lengths"][0].tolist()
         assert sorted(subseq_lengths) == [5, 6]  # raw, un-padded
-        # Each sub-seq's padded footprint must be divisible by 2*cp_size=4 so
-        # the per-sub-seq zigzag splits evenly across CP ranks.
+        # Each sub-seq's padded footprint must produce 16-aligned local CP rank
+        # slabs after dividing by cp_size=2.
         for s in subseq_lengths:
-            padded = ((s + 3) // 4) * 4
-            assert padded % (2 * 2) == 0
+            padded = ((s + 31) // 32) * 32
+            assert (padded // 2) % 16 == 0
+
+    def test_fp8_alignment_is_conditional(self):
+        examples = [
+            _make_example(3, 1, base_token=100),
+            _make_example(3, 1, base_token=200),
+        ]
+
+        bf16 = _make_collator(num_gpus=1, batch_size=2, max_length=64, fp8=False)
+        bf16_batch = bf16(examples, batch_size=2)
+        assert bf16_batch["sequences"].shape[1] == 6
+        bf16_chunks = [bf16_batch["sequences"][0, :3].tolist(), bf16_batch["sequences"][0, 3:6].tolist()]
+        assert sorted(bf16_chunks) == [[100, 101, 102], [200, 201, 202]]
+
+        fp8 = _make_collator(num_gpus=1, batch_size=2, max_length=64, fp8=True)
+        fp8_batch = fp8(examples, batch_size=2)
+        assert fp8_batch["sequences"].shape[1] == 32
+        fp8_chunks = [fp8_batch["sequences"][0, :3].tolist(), fp8_batch["sequences"][0, 16:19].tolist()]
+        assert sorted(fp8_chunks) == [[100, 101, 102], [200, 201, 202]]
+
+    def test_tp_gt_1_fp8_alignment_uses_local_128(self):
+        """TP>1 FP8 row layout must satisfy TE blockwise input all-gather."""
+        examples = [
+            _make_example(3, 1, base_token=100),
+            _make_example(3, 1, base_token=200),
+        ]
+
+        fp8 = _make_collator(num_gpus=2, batch_size=2, max_length=512, tp=2, fp8=True)
+        fp8_batch = fp8(examples, batch_size=2)
+
+        assert fp8_batch["sequences"].shape[1] == 512
+        fp8_chunks = [fp8_batch["sequences"][0, :3].tolist(), fp8_batch["sequences"][0, 256:259].tolist()]
+        assert sorted(fp8_chunks) == [[100, 101, 102], [200, 201, 202]]
 
     def test_eval_path_falls_back_to_super(self):
         """When batch_size != self.sft_cfg.batch_size (eval), no packing happens."""
@@ -272,8 +333,8 @@ class TestPackingValidation:
 
     def test_accepts_cp_gt_1(self):
         # CP > 1 is supported: preprocess/postprocess zigzag-shard the packed
-        # THD per sub-seq, and the collator uses align_size = tp_size*cp_size*2
-        # to match. _validate_packing_cfg must NOT raise.
+        # THD per sub-seq, and the collator uses the same CP-safe alignment
+        # as preprocess_packed_seqs. _validate_packing_cfg must NOT raise.
         cfg = SFTConfig(
             strategy="megatron",
             remove_microbatch_padding=True,
