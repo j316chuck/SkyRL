@@ -46,6 +46,9 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
 from skyrl.backends.skyrl_train.patches.megatron.patch_dsa_index_share import (
     patch_dsa_index_share,
 )
+from skyrl.backends.skyrl_train.patches.megatron.patch_dsa_masked_softmax import (
+    apply_dsa_masked_softmax_patch,
+)
 from skyrl.backends.skyrl_train.patches.megatron.patch_shared_expert_lora_tp import (
     apply_shared_expert_lora_tp_patch,
 )
@@ -496,6 +499,10 @@ class MegatronWorker:
         # Delete along with the patch module once the megatron-core pin includes
         # NVIDIA/Megatron-LM#6793.
         patch_dsa_index_share()
+
+        # The unfused absorbed-DSA path otherwise materializes several 4-D copies
+        # of its attention matrix. At 32K this adds 32 GiB per copy and OOMs B300.
+        apply_dsa_masked_softmax_patch()
 
         # Give the Qwen3-VL ViT the language model's attention backend; megatron-core
         # now asserts NVTE_* attention env vars agree across all models in a process.
