@@ -61,6 +61,20 @@ def test_inference_runtime_rejects_training():
         backend.forward(SimpleNamespace(all_model_inputs=[]))
 
 
+def test_inference_runtime_accepts_tinker_base_model_sentinel():
+    backend = object.__new__(SkyRLTrainBackend)
+    backend._model_ids_to_role = {}
+    backend._ensure_inference_engines = Mock()
+    backend._sample_with_remote_client = Mock(return_value={"request-a": "ok"})
+    batch = SimpleNamespace(
+        all_model_ids=[""],
+        request_batch_slices=[("request-a", "", 0, 1, False, 0)],
+    )
+
+    assert backend.sample(batch) == {"request-a": "ok"}
+    backend._sample_with_remote_client.assert_called_once_with(batch)
+
+
 def test_combined_runtime_requires_a_model_before_sampling():
     backend = object.__new__(SkyRLTrainBackend)
     backend.config = MegatronBackendOverrides(runtime_role="combined")
