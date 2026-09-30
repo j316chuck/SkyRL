@@ -15,6 +15,9 @@ try:
     from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
     from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
     from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+    # Import for registration: GLM-5.3-Flash's ``glm5_next`` architecture is
+    # provided by Megatron-Bridge but is not imported by AutoBridge itself.
+    from megatron.bridge.models.glm5_next import Glm5NextBridge  # noqa: F401
     from megatron.bridge.models.qwen.qwen35_bridge import Qwen35Bridge, Qwen35MoEBridge
     from megatron.core.models.gpt.gpt_model import GPTModel
 
