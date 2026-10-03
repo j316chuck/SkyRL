@@ -1235,6 +1235,7 @@ class SkyRLTrainBackend(AbstractBackend):
         if self.config.runtime_role == "inference":
             raise RuntimeError("Training is unavailable in an inference-only runtime")
         role = self._get_role(model_id)
+        self._sleep_inference_engines()
 
         # Apply learning rate from AdamParams before optimizer step
         # Note: beta1, beta2, eps are fixed at optimizer creation and cannot be changed dynamically

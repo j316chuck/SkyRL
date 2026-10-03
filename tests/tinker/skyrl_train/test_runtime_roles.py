@@ -1,10 +1,13 @@
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, create_autospec, patch
 
 import pytest
 
 skyrl_train_backend = pytest.importorskip("skyrl.backends.skyrl_train_backend")
 
+from skyrl.backends.skyrl_train.workers.worker_dispatch import (  # noqa: E402
+    WorkerDispatch,
+)
 from skyrl.backends.skyrl_train_backend import (  # noqa: E402
     MegatronBackendOverrides,
     SkyRLTrainBackend,
@@ -59,6 +62,28 @@ def test_inference_runtime_rejects_training():
 
     with pytest.raises(RuntimeError, match="inference-only"):
         backend.forward(SimpleNamespace(all_model_inputs=[]))
+
+
+def test_optimizer_sleeps_inference_before_restoring_training_state():
+    backend = object.__new__(SkyRLTrainBackend)
+    backend.config = MegatronBackendOverrides(runtime_role="combined")
+    backend._model_ids_to_role = {"model-a": "policy"}
+    calls = Mock()
+    backend._sleep_inference_engines = create_autospec(backend._sleep_inference_engines)
+    backend._dispatch = create_autospec(WorkerDispatch, instance=True)
+    calls.attach_mock(backend._sleep_inference_engines, "sleep")
+    calls.attach_mock(backend._dispatch, "dispatch")
+    backend._dispatch.optim_step.return_value = 3.0
+
+    adam_params = types.AdamParams(learning_rate=0.001, beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.01)
+    output = backend.optim_step("model-a", types.OptimStepInput(adam_params=adam_params))
+
+    assert calls.mock_calls == [
+        call.sleep(),
+        call.dispatch.set_lr("policy", 0.001, model_id="model-a"),
+        call.dispatch.optim_step("policy", model_id="model-a"),
+    ]
+    assert output.metrics["skyrl.ai/grad_norm"] == 3.0
 
 
 def test_combined_runtime_requires_a_model_before_sampling():
