@@ -18,7 +18,8 @@ Everything they depend on -- ``_compute_index_scores``, ``hadamard_transform``, 
 -- already exists in the pinned megatron-core with identical signatures, so this module needs
 no patching of megatron itself.
 
-DELETE THIS MODULE once the megatron-core pin includes #7522.
+Query-chunked scoring bounds the temporary per-head score tensor.
+DELETE THIS MODULE once the megatron-core pin includes #7522 and bounded scoring.
 """
 
 from typing import Optional, Tuple
@@ -33,6 +34,22 @@ try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
     hadamard_transform = None
+
+
+def _kpool_index_scores(q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor, use_relu: bool) -> torch.Tensor:
+    """Bound per-head score temporaries without changing pooled scores or selection."""
+    chunk_size = 256
+    if q.size(0) <= chunk_size:
+        return _compute_index_scores(q, weights, k, use_relu=use_relu)
+    return torch.cat(
+        [
+            _compute_index_scores(
+                q[start : start + chunk_size], weights[start : start + chunk_size], k, use_relu=use_relu
+            )
+            for start in range(0, q.size(0), chunk_size)
+        ],
+        dim=1,
+    )
 
 
 def _kpool_fp8_input(x: torch.Tensor) -> torch.Tensor:
@@ -196,7 +213,7 @@ def fused_qk_topk_kpool(
 
     if fp8_indexer:
         q, k_pooled = _kpool_fp8_input(q), _kpool_fp8_input(k_pooled)
-    index_scores = _compute_index_scores(q, weights, k_pooled, use_relu=use_relu)
+    index_scores = _kpool_index_scores(q, weights, k_pooled, use_relu=use_relu)
 
     # A pool is causal only when its final token is within the query's bounds.
     pool_positions = pool_token_base + (pool_size - 1)

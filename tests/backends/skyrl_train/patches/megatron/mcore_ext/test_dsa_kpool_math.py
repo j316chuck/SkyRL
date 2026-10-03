@@ -24,6 +24,30 @@ POOL_SIZE = 4
 HEAD_DIM = 128
 
 
+@pytest.mark.parametrize("seqlen", [0, 1, 256, 257, 769, 65536])
+@pytest.mark.parametrize("use_relu", [False, True])
+def test_kpool_index_scores_preserve_values_and_bound_query_chunks(seqlen, use_relu, monkeypatch):
+    from skyrl.backends.skyrl_train.patches.megatron.mcore_ext import dsa_kpool
+
+    gen = torch.Generator().manual_seed(17)
+    q = torch.randn(seqlen, 2, 4, 16, generator=gen)
+    weights = torch.randn(seqlen, 2, 4, generator=gen)
+    k = torch.randn(23, 2, 16, generator=gen)
+    original = dsa_kpool._compute_index_scores
+    expected = original(q, weights, k, use_relu=use_relu)
+    query_sizes = []
+
+    def bounded_scores(query, query_weights, keys, use_relu):
+        query_sizes.append(query.size(0))
+        return original(query, query_weights, keys, use_relu=use_relu)
+
+    monkeypatch.setattr(dsa_kpool, "_compute_index_scores", bounded_scores)
+    actual = dsa_kpool._kpool_index_scores(q, weights, k, use_relu)
+    torch.testing.assert_close(actual, expected)
+    assert sum(query_sizes) == seqlen
+    assert max(query_sizes) <= 256
+
+
 def _hf_reference_pool(k: torch.Tensor, gate_score: torch.Tensor, ape: torch.Tensor, pool_size: int):
     """Independent transcription of HF ``Glm5NextTextIndexer`` pooling.
 
