@@ -381,7 +381,11 @@ class FusedLinearChunkedDistributedLogprob(torch.autograd.Function):
         # is never built — each chunk's logit grad is immediately projected onto
         # grad_hidden / grad_weight and then freed.
         grad_hidden = torch.empty_like(hidden)
-        grad_weight = torch.zeros((partition_vocab_size, hidden_size), dtype=torch.float32, device=weight.device)
+        grad_weight = (
+            torch.zeros((partition_vocab_size, hidden_size), dtype=torch.float32, device=weight.device)
+            if ctx.needs_input_grad[1]
+            else None
+        )
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -424,10 +428,13 @@ class FusedLinearChunkedDistributedLogprob(torch.autograd.Function):
             # ColumnParallelLinear's own backward does and is much faster / uses
             # less memory than an fp32 matmul, while the cross-chunk accumulation
             # still happens in fp32.
-            grad_weight.add_(torch.matmul(grad_logits_2d.t(), h_2d.to(dtype=grad_logits.dtype)).to(torch.float32))
+            if grad_weight is not None:
+                grad_weight.add_(torch.matmul(grad_logits_2d.t(), h_2d.to(dtype=grad_logits.dtype)).to(torch.float32))
 
         # forward args: hidden, weight, target, vocab_start, vocab_end, chunk_size, tp_group, inference_only
-        return grad_hidden, grad_weight.to(weight.dtype), None, None, None, None, None, None
+        if grad_weight is not None:
+            grad_weight = grad_weight.to(weight.dtype)
+        return grad_hidden, grad_weight, None, None, None, None, None, None
 
 
 def _fused_lm_head_logprob_apply(

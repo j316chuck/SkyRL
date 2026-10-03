@@ -163,6 +163,21 @@ def test_fused_forward_matches_liger_flce(tp_group):
     torch.testing.assert_close(out_f.reshape(-1), (-ce).float(), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+def test_frozen_weight_preserves_hidden_gradient(tp_group, weight_dtype):
+    torch.manual_seed(7)
+    hidden = torch.randn(2, 32, H, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(4096, H, device="cuda", dtype=weight_dtype) * H**-0.5
+    target = torch.randint(0, 4096, (2, 32), device="cuda")
+    expected_out, expected_grad, _ = _fused_fb(hidden, weight, target, 0, 4096, tp_group, 7)
+    hidden.requires_grad_(True)
+    out = FusedLinearChunkedDistributedLogprob.apply(hidden, weight, target, 0, 4096, 7, tp_group, False)
+    out.backward(_grad_seed(out))
+    torch.testing.assert_close(out, expected_out, atol=0, rtol=0)
+    torch.testing.assert_close(hidden.grad, expected_grad, atol=0, rtol=0)
+    assert weight.grad is None
+
+
 # ---------------------------------------------------------------------------
 # TP>1: vocab-parallel correctness via torchrun (spawned as a subprocess).
 # ---------------------------------------------------------------------------
